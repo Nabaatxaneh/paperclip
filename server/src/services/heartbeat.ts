@@ -51,6 +51,7 @@ import type {
 import { createLocalAgentJwt } from "../agent-auth-jwt.js";
 import { parseObject, asBoolean, asNumber, appendWithByteCap, MAX_EXCERPT_BYTES } from "../adapters/utils.js";
 import { costService } from "./costs.js";
+import { computeTokenCostCents } from "./model-pricing.js";
 import { trackAgentFirstHeartbeat } from "@paperclipai/shared/telemetry";
 import { getTelemetryClient } from "../telemetry.js";
 import { companySkillService } from "./company-skills.js";
@@ -1202,10 +1203,29 @@ function resolveLedgerBiller(result: AdapterExecutionResult): string {
   return readNonEmptyString(result.biller) ?? readNonEmptyString(result.provider) ?? "unknown";
 }
 
-function normalizeBilledCostCents(costUsd: number | null | undefined, billingType: BillingType): number {
-  if (billingType === "subscription_included") return 0;
-  if (typeof costUsd !== "number" || !Number.isFinite(costUsd)) return 0;
-  return Math.max(0, Math.round(costUsd * 100));
+function normalizeBilledCostCents(
+  costUsd: number | null | undefined,
+  billingType: BillingType,
+  context?: { model?: string | null; usage?: UsageTotals | null },
+): number {
+  // For metered billing, the adapter-reported USD cost is authoritative.
+  if (billingType === "metered_api" || billingType === "subscription_overage") {
+    if (typeof costUsd === "number" && Number.isFinite(costUsd) && costUsd > 0) {
+      return Math.max(0, Math.round(costUsd * 100));
+    }
+  }
+  // For subscription / unknown / missing-cost runs, fall back to the
+  // model-pricing table so token usage still rolls up to a non-zero,
+  // API-equivalent spend number.
+  const usage = context?.usage ?? null;
+  if (usage && (usage.inputTokens > 0 || usage.cachedInputTokens > 0 || usage.outputTokens > 0)) {
+    const fallback = computeTokenCostCents(context?.model ?? null, usage);
+    if (fallback > 0) return fallback;
+  }
+  if (typeof costUsd === "number" && Number.isFinite(costUsd) && costUsd > 0) {
+    return Math.max(0, Math.round(costUsd * 100));
+  }
+  return 0;
 }
 
 async function resolveLedgerScopeForRun(
@@ -4770,7 +4790,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     const outputTokens = usage?.outputTokens ?? 0;
     const cachedInputTokens = usage?.cachedInputTokens ?? 0;
     const billingType = normalizeLedgerBillingType(result.billingType);
-    const additionalCostCents = normalizeBilledCostCents(result.costUsd, billingType);
+    const additionalCostCents = normalizeBilledCostCents(result.costUsd, billingType, {
+      model: result.model ?? null,
+      usage: usage ?? null,
+    });
     const hasTokenUsage = inputTokens > 0 || outputTokens > 0 || cachedInputTokens > 0;
     const provider = result.provider ?? "unknown";
     const biller = resolveLedgerBiller(result);
