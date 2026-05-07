@@ -33,6 +33,12 @@ const MAX_CANDIDATE_ISSUES = 250;
 const MAX_RUNS_FOR_STREAK = 100;
 const MAX_PARENT_WALK_DEPTH = 25;
 export const PRODUCTIVITY_REVIEW_REFRESH_COMMENT_PREFIX = "Productivity review evidence refreshed.";
+export const PRODUCTIVITY_REVIEW_AUTO_RESOLVE_COMMENT_PREFIX = "Productivity review auto-resolved.";
+const AUTO_RESOLVE_REASONS = {
+  source_done: "source_issue_completed",
+  source_cancelled: "source_issue_cancelled",
+} as const;
+type AutoResolveReason = (typeof AUTO_RESOLVE_REASONS)[keyof typeof AUTO_RESOLVE_REASONS];
 
 type IssueRow = typeof issues.$inferSelect;
 type AgentRow = typeof agents.$inferSelect;
@@ -760,6 +766,16 @@ export function productivityReviewService(db: Db, deps?: { enqueueWakeup?: Enque
   }) {
     const now = opts?.now ?? new Date();
     const thresholds = buildThresholds(opts?.thresholds);
+    const orphanCleanup = await resolveOrphanedProductivityReviews({
+      companyId: opts?.companyId,
+      now,
+    }).catch((err) => {
+      logger.warn(
+        { err, companyId: opts?.companyId ?? null },
+        "productivity review orphan cleanup failed",
+      );
+      return null;
+    });
     const candidates = await db
       .select()
       .from(issues)
@@ -787,6 +803,8 @@ export function productivityReviewService(db: Db, deps?: { enqueueWakeup?: Enque
       failed: 0,
       reviewIssueIds: [] as string[],
       failedIssueIds: [] as string[],
+      orphanResolved: orphanCleanup?.resolved ?? 0,
+      orphanResolvedReviewIssueIds: orphanCleanup?.reviewIssueIds ?? ([] as string[]),
     };
 
     const prefixCache = new Map<string, string>();
@@ -901,9 +919,212 @@ export function productivityReviewService(db: Db, deps?: { enqueueWakeup?: Enque
     });
   }
 
+  function buildAutoResolveCommentBody(input: {
+    sourceIssue: Pick<IssueRow, "id" | "identifier" | "status">;
+    reason: AutoResolveReason;
+    prefix: string;
+  }) {
+    const sourceLink = issueUiLink({ identifier: input.sourceIssue.identifier, id: input.sourceIssue.id }, input.prefix);
+    const sourceLabel = input.reason === AUTO_RESOLVE_REASONS.source_cancelled ? "cancelled" : "done";
+    return [
+      PRODUCTIVITY_REVIEW_AUTO_RESOLVE_COMMENT_PREFIX,
+      "",
+      `- Source issue ${sourceLink} transitioned to \`${sourceLabel}\`; this review is no longer actionable.`,
+      `- Reason: \`${input.reason}\`.`,
+      "- Closing automatically. Reopen this issue manually if a retroactive review is still needed.",
+    ].join("\n");
+  }
+
+  async function resolveOpenReviewsForSource(input: {
+    companyId: string;
+    sourceIssue: IssueRow;
+    reason: AutoResolveReason;
+    now: Date;
+    prefix?: string;
+  }) {
+    const openReviews = await db
+      .select()
+      .from(issues)
+      .where(
+        and(
+          eq(issues.companyId, input.companyId),
+          eq(issues.originKind, PRODUCTIVITY_REVIEW_ORIGIN_KIND),
+          eq(issues.originId, input.sourceIssue.id),
+          isNull(issues.hiddenAt),
+          notInArray(issues.status, ["done", "cancelled"]),
+        ),
+      );
+    if (openReviews.length === 0) return [] as string[];
+
+    const prefix = input.prefix ?? (await getCompanyIssuePrefix(input.companyId));
+    const resolvedIds: string[] = [];
+    for (const review of openReviews) {
+      await db
+        .update(issues)
+        .set({
+          status: "done",
+          completedAt: input.now,
+          cancelledAt: null,
+          updatedAt: input.now,
+          checkoutRunId: null,
+          executionRunId: null,
+          executionAgentNameKey: null,
+          executionLockedAt: null,
+        })
+        .where(eq(issues.id, review.id));
+
+      try {
+        await issuesSvc.addComment(
+          review.id,
+          buildAutoResolveCommentBody({
+            sourceIssue: input.sourceIssue,
+            reason: input.reason,
+            prefix,
+          }),
+          {},
+        );
+      } catch (err) {
+        logger.warn(
+          {
+            err,
+            companyId: input.companyId,
+            reviewIssueId: review.id,
+            sourceIssueId: input.sourceIssue.id,
+          },
+          "productivity review auto-resolve comment failed",
+        );
+      }
+
+      await logActivity(db, {
+        companyId: input.companyId,
+        actorType: "system",
+        actorId: "system",
+        agentId: review.assigneeAgentId,
+        action: "issue.productivity_review_auto_resolved",
+        entityType: "issue",
+        entityId: review.id,
+        details: {
+          source: "productivity_review.auto_resolve",
+          sourceIssueId: input.sourceIssue.id,
+          reason: input.reason,
+          previousStatus: review.status,
+        },
+      });
+
+      resolvedIds.push(review.id);
+    }
+    return resolvedIds;
+  }
+
+  async function cascadeResolveForSourceCompletion(opts: {
+    companyId: string;
+    sourceIssueId: string;
+    reason: AutoResolveReason;
+    now?: Date;
+  }) {
+    const sourceIssue = await db
+      .select()
+      .from(issues)
+      .where(and(eq(issues.companyId, opts.companyId), eq(issues.id, opts.sourceIssueId)))
+      .then((rows) => rows[0] ?? null);
+    if (!sourceIssue) return { resolvedReviewIds: [] as string[] };
+    return {
+      resolvedReviewIds: await resolveOpenReviewsForSource({
+        companyId: opts.companyId,
+        sourceIssue,
+        reason: opts.reason,
+        now: opts.now ?? new Date(),
+      }),
+    };
+  }
+
+  async function resolveOrphanedProductivityReviews(opts?: { companyId?: string; now?: Date; limit?: number }) {
+    const now = opts?.now ?? new Date();
+    const limit = Math.max(1, Math.min(opts?.limit ?? MAX_CANDIDATE_ISSUES, MAX_CANDIDATE_ISSUES));
+    const openReviews = await db
+      .select()
+      .from(issues)
+      .where(
+        and(
+          opts?.companyId ? eq(issues.companyId, opts.companyId) : undefined,
+          eq(issues.originKind, PRODUCTIVITY_REVIEW_ORIGIN_KIND),
+          isNull(issues.hiddenAt),
+          notInArray(issues.status, ["done", "cancelled"]),
+          sql`${issues.originId} is not null`,
+        ),
+      )
+      .orderBy(asc(issues.updatedAt), asc(issues.id))
+      .limit(limit);
+
+    const result = {
+      scanned: openReviews.length,
+      resolved: 0,
+      reviewIssueIds: [] as string[],
+      failed: 0,
+      failedReviewIssueIds: [] as string[],
+    };
+    if (openReviews.length === 0) return result;
+
+    const sourcePairs = openReviews
+      .map((review) => ({ companyId: review.companyId, sourceIssueId: review.originId as string }))
+      .filter((pair) => Boolean(pair.sourceIssueId));
+    const uniqueSourceIds = Array.from(new Set(sourcePairs.map((pair) => pair.sourceIssueId)));
+    if (uniqueSourceIds.length === 0) return result;
+
+    const sourceRows = await db
+      .select()
+      .from(issues)
+      .where(inArray(issues.id, uniqueSourceIds));
+    const sourceById = new Map(sourceRows.map((row) => [row.id, row]));
+
+    const prefixCache = new Map<string, string>();
+    const seenSourceIds = new Set<string>();
+    for (const review of openReviews) {
+      const sourceIssue = sourceById.get(review.originId as string) ?? null;
+      if (!sourceIssue || sourceIssue.companyId !== review.companyId) continue;
+      if (sourceIssue.status !== "done" && sourceIssue.status !== "cancelled") continue;
+      if (seenSourceIds.has(sourceIssue.id)) continue;
+      seenSourceIds.add(sourceIssue.id);
+      const reason: AutoResolveReason =
+        sourceIssue.status === "cancelled" ? AUTO_RESOLVE_REASONS.source_cancelled : AUTO_RESOLVE_REASONS.source_done;
+      try {
+        let prefix = prefixCache.get(review.companyId);
+        if (!prefix) {
+          prefix = await getCompanyIssuePrefix(review.companyId);
+          prefixCache.set(review.companyId, prefix);
+        }
+        const resolvedIds = await resolveOpenReviewsForSource({
+          companyId: review.companyId,
+          sourceIssue,
+          reason,
+          now,
+          prefix,
+        });
+        result.resolved += resolvedIds.length;
+        result.reviewIssueIds.push(...resolvedIds);
+      } catch (err) {
+        result.failed += 1;
+        result.failedReviewIssueIds.push(review.id);
+        logger.warn(
+          {
+            err,
+            companyId: review.companyId,
+            reviewIssueId: review.id,
+            sourceIssueId: review.originId,
+          },
+          "productivity review backfill resolve failed",
+        );
+      }
+    }
+
+    return result;
+  }
+
   return {
     reconcileProductivityReviews,
     isProductivityReviewContinuationHoldActive,
     recordContinuationHold,
+    cascadeResolveForSourceCompletion,
+    resolveOrphanedProductivityReviews,
   };
 }

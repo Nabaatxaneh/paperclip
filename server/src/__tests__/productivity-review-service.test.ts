@@ -23,6 +23,7 @@ import {
   PRODUCTIVITY_REVIEW_ORIGIN_KIND,
   productivityReviewService,
 } from "../services/productivity-review.ts";
+import { issueService } from "../services/issues.ts";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
@@ -561,5 +562,141 @@ describeEmbeddedPostgres("productivity review service", () => {
     expect(result.failed).toBe(0);
     const [review] = await listProductivityReviews(seeded.companyId);
     expect(review?.requestDepth).toBe(MAX_ISSUE_REQUEST_DEPTH);
+  });
+
+  it("auto-resolves an open productivity review when the source issue completes", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const seeded = await seedAssignedIssue();
+    await insertRuns({
+      companyId: seeded.companyId,
+      agentId: seeded.coderId,
+      issueId: seeded.issueId,
+      count: DEFAULT_PRODUCTIVITY_REVIEW_NO_COMMENT_STREAK_RUNS,
+      now,
+    });
+
+    const service = productivityReviewService(db);
+    await service.reconcileProductivityReviews({ now, companyId: seeded.companyId });
+    const [review] = await listProductivityReviews(seeded.companyId);
+    expect(review?.status).toBe("todo");
+
+    const completedAt = new Date(now.getTime() + 60_000);
+    const cascadeResult = await service.cascadeResolveForSourceCompletion({
+      companyId: seeded.companyId,
+      sourceIssueId: seeded.issueId,
+      reason: "source_issue_completed",
+      now: completedAt,
+    });
+
+    expect(cascadeResult.resolvedReviewIds).toEqual([review!.id]);
+    const [updatedReview] = await db
+      .select()
+      .from(issues)
+      .where(eq(issues.id, review!.id));
+    expect(updatedReview?.status).toBe("done");
+    expect(updatedReview?.completedAt?.toISOString()).toBe(completedAt.toISOString());
+
+    const autoComments = await db
+      .select()
+      .from(issueComments)
+      .where(
+        and(
+          eq(issueComments.issueId, review!.id),
+          sql`${issueComments.body} like 'Productivity review auto-resolved.%'`,
+        ),
+      );
+    expect(autoComments).toHaveLength(1);
+    expect(autoComments[0]?.body).toContain("source_issue_completed");
+
+    const activityRows = await db
+      .select()
+      .from(activityLog)
+      .where(
+        and(
+          eq(activityLog.entityType, "issue"),
+          eq(activityLog.entityId, review!.id),
+          eq(activityLog.action, "issue.productivity_review_auto_resolved"),
+        ),
+      );
+    expect(activityRows).toHaveLength(1);
+  });
+
+  it("auto-resolves an open productivity review when issueService.update() flips the source to done", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const seeded = await seedAssignedIssue();
+    await insertRuns({
+      companyId: seeded.companyId,
+      agentId: seeded.coderId,
+      issueId: seeded.issueId,
+      count: DEFAULT_PRODUCTIVITY_REVIEW_NO_COMMENT_STREAK_RUNS,
+      now,
+    });
+
+    const reviews = productivityReviewService(db);
+    await reviews.reconcileProductivityReviews({ now, companyId: seeded.companyId });
+    const [review] = await listProductivityReviews(seeded.companyId);
+    expect(review?.status).toBe("todo");
+
+    const issuesSvc = issueService(db);
+    const updatedSource = await issuesSvc.update(seeded.issueId, { status: "done" });
+    expect(updatedSource?.status).toBe("done");
+
+    const [resolvedReview] = await db
+      .select()
+      .from(issues)
+      .where(eq(issues.id, review!.id));
+    expect(resolvedReview?.status).toBe("done");
+
+    const autoComments = await db
+      .select()
+      .from(issueComments)
+      .where(
+        and(
+          eq(issueComments.issueId, review!.id),
+          sql`${issueComments.body} like 'Productivity review auto-resolved.%'`,
+        ),
+      );
+    expect(autoComments).toHaveLength(1);
+  });
+
+  it("backfill: reconcileProductivityReviews resolves orphaned reviews whose source is already done", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const seeded = await seedAssignedIssue();
+
+    await db.insert(issues).values({
+      id: randomUUID(),
+      companyId: seeded.companyId,
+      title: "Phantom productivity review",
+      status: "todo",
+      priority: "high",
+      originKind: PRODUCTIVITY_REVIEW_ORIGIN_KIND,
+      originId: seeded.issueId,
+      originFingerprint: `productivity-review:${seeded.issueId}`,
+      parentId: seeded.issueId,
+      assigneeAgentId: seeded.managerId,
+      issueNumber: 99,
+      identifier: `${seeded.issuePrefix}-99`,
+      createdAt: new Date(now.getTime() - 6 * 60 * 60 * 1000),
+      updatedAt: new Date(now.getTime() - 6 * 60 * 60 * 1000),
+    });
+    await db
+      .update(issues)
+      .set({ status: "done", completedAt: new Date(now.getTime() - 5 * 60 * 60 * 1000) })
+      .where(eq(issues.id, seeded.issueId));
+
+    const before = await listProductivityReviews(seeded.companyId);
+    expect(before.filter((r) => r.status === "todo")).toHaveLength(1);
+
+    const result = await productivityReviewService(db).reconcileProductivityReviews({
+      now,
+      companyId: seeded.companyId,
+    });
+
+    expect(result.orphanResolved).toBe(1);
+    expect(result.orphanResolvedReviewIssueIds).toHaveLength(1);
+
+    const after = await listProductivityReviews(seeded.companyId);
+    expect(after).toHaveLength(1);
+    expect(after[0]?.status).toBe("done");
   });
 });

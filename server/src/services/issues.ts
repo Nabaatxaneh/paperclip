@@ -52,7 +52,9 @@ import {
   issueTreeControlService,
   type ActiveIssueTreePauseHoldGate,
 } from "./issue-tree-control.js";
-import { parseIssueGraphLivenessIncidentKey } from "./recovery/origins.js";
+import { parseIssueGraphLivenessIncidentKey, RECOVERY_ORIGIN_KINDS } from "./recovery/origins.js";
+import { logger } from "../middleware/logger.js";
+import { productivityReviewService } from "./productivity-review.js";
 
 const ALL_ISSUE_STATUSES = ["backlog", "todo", "in_progress", "in_review", "blocked", "done", "cancelled"];
 const MAX_ISSUE_COMMENT_PAGE_LIMIT = 500;
@@ -3028,7 +3030,34 @@ export function issueService(db: Db) {
         return enriched;
       };
 
-      return dbOrTx === db ? db.transaction(runUpdate) : runUpdate(dbOrTx);
+      const result = await (dbOrTx === db ? db.transaction(runUpdate) : runUpdate(dbOrTx));
+
+      if (
+        result &&
+        existing.status !== result.status &&
+        (result.status === "done" || result.status === "cancelled") &&
+        existing.originKind !== RECOVERY_ORIGIN_KINDS.issueProductivityReview
+      ) {
+        try {
+          await productivityReviewService(db).cascadeResolveForSourceCompletion({
+            companyId: existing.companyId,
+            sourceIssueId: existing.id,
+            reason: result.status === "cancelled" ? "source_issue_cancelled" : "source_issue_completed",
+          });
+        } catch (err) {
+          logger.warn(
+            {
+              err,
+              companyId: existing.companyId,
+              sourceIssueId: existing.id,
+              terminalStatus: result.status,
+            },
+            "productivity review cascade auto-resolve failed",
+          );
+        }
+      }
+
+      return result;
     },
 
     clearExecutionWorkspaceEnvironmentSelection: async (companyId: string, environmentId: string) => {
