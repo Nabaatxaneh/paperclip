@@ -76,6 +76,6 @@ export function errorHandler(
 
   res.status(500).json({
     error: "Internal server error",
-    code: rootError.name ?? "UnknownError",
+    details: { name: rootError.name ?? "UnknownError", message: rootError.message },
   });
 }
