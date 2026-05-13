@@ -1594,7 +1594,7 @@ function describeSessionResetReason(
   return null;
 }
 
-function shouldAutoCheckoutIssueForWake(input: {
+export function shouldAutoCheckoutIssueForWake(input: {
   contextSnapshot: Record<string, unknown> | null | undefined;
   issueStatus: string | null;
   issueAssigneeAgentId: string | null;
@@ -1605,10 +1605,14 @@ function shouldAutoCheckoutIssueForWake(input: {
   if (!input.isDependencyReady) return false;
 
   const issueStatus = readNonEmptyString(input.issueStatus);
+  // `blocked` is sticky: the auto-resume harness must never flip an assigned
+  // issue from blocked back to in_progress. An explicit PATCH (by a human or
+  // by the assigned agent) is the only way out of blocked. This prevents the
+  // blocked↔in_progress oscillation when an issue is blocked on an external
+  // dependency that is not modelled as a `blockerIssueIds` relation.
   if (
     issueStatus !== "todo" &&
     issueStatus !== "backlog" &&
-    issueStatus !== "blocked" &&
     issueStatus !== "in_progress"
   ) {
     return false;
@@ -4962,7 +4966,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       })
     ) {
       try {
-        await issuesSvc.checkout(issueId, agent.id, ["todo", "backlog", "blocked"], run.id);
+        await issuesSvc.checkout(issueId, agent.id, ["todo", "backlog"], run.id);
         context[PAPERCLIP_HARNESS_CHECKOUT_KEY] = true;
       } catch (error) {
         if (!isCheckoutConflictError(error)) throw error;
