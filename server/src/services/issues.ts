@@ -811,9 +811,16 @@ type IssueRelationSummaryRow = {
   priority: string;
   assigneeAgentId: string | null;
   assigneeUserId: string | null;
+  /** Creator of the relation row (not the issue). Present only for blocked-by rows. */
+  relationCreatedByAgentId?: string | null;
+  relationCreatedByUserId?: string | null;
 };
 
 function summarizeIssueRelationRow(row: IssueRelationSummaryRow): IssueRelationIssueSummary {
+  const isSystemSpawned =
+    row.relationCreatedByAgentId != null && row.relationCreatedByUserId == null
+      ? true
+      : undefined;
   return {
     id: row.relatedId,
     identifier: row.identifier,
@@ -822,6 +829,7 @@ function summarizeIssueRelationRow(row: IssueRelationSummaryRow): IssueRelationI
     priority: row.priority as IssueRelationIssueSummary["priority"],
     assigneeAgentId: row.assigneeAgentId,
     assigneeUserId: row.assigneeUserId,
+    ...(isSystemSpawned !== undefined ? { isSystemSpawned } : {}),
   };
 }
 
@@ -1823,6 +1831,8 @@ export function issueService(db: Db) {
           priority: issues.priority,
           assigneeAgentId: issues.assigneeAgentId,
           assigneeUserId: issues.assigneeUserId,
+          relationCreatedByAgentId: issueRelations.createdByAgentId,
+          relationCreatedByUserId: issueRelations.createdByUserId,
         })
         .from(issueRelations)
         .innerJoin(issues, eq(issueRelations.issueId, issues.id))

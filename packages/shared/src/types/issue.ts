@@ -119,6 +119,8 @@ export interface IssueRelationIssueSummary {
   assigneeAgentId: string | null;
   assigneeUserId: string | null;
   terminalBlockers?: IssueRelationIssueSummary[];
+  /** True when the blocking relation was created by the system (recovery/automation), not a human or the blocked issue's own agent. */
+  isSystemSpawned?: boolean;
 }
 
 export type IssueBlockerAttentionState = "none" | "covered" | "stalled" | "needs_attention";
