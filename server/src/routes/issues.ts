@@ -702,11 +702,13 @@ export function issueRoutes(
     if (issue.status === "blocked") {
       const readiness = await svc.getDependencyReadiness(issue.id);
       if (readiness.unresolvedBlockerCount > 0) {
+        const unresolvedBlockers = await svc.getUnresolvedBlockerSummaries(issue.id);
         res.status(409).json({
           error: "Issue follow-up blocked by unresolved blockers",
           details: {
             issueId: issue.id,
             unresolvedBlockerIssueIds: readiness.unresolvedBlockerIssueIds,
+            unresolvedBlockers,
           },
         });
         return false;
@@ -1979,12 +1981,21 @@ export function issueRoutes(
     const updateReferenceSummaryBefore = titleOrDescriptionChanged
       ? await issueReferencesSvc.listIssueReferenceSummary(existing.id)
       : null;
-    const hasUnresolvedFirstClassBlockers =
+    const patchDependencyReadiness =
       isBlocked && effectiveMoveToTodoRequested
-        ? (await svc.getDependencyReadiness(existing.id)).unresolvedBlockerCount > 0
-        : false;
+        ? await svc.getDependencyReadiness(existing.id)
+        : null;
+    const hasUnresolvedFirstClassBlockers = (patchDependencyReadiness?.unresolvedBlockerCount ?? 0) > 0;
     if (resumeRequested === true && isBlocked && hasUnresolvedFirstClassBlockers) {
-      res.status(409).json({ error: "Issue follow-up blocked by unresolved blockers" });
+      const unresolvedBlockers = await svc.getUnresolvedBlockerSummaries(existing.id);
+      res.status(409).json({
+        error: "Issue follow-up blocked by unresolved blockers",
+        details: {
+          issueId: existing.id,
+          unresolvedBlockerIssueIds: patchDependencyReadiness?.unresolvedBlockerIssueIds ?? [],
+          unresolvedBlockers,
+        },
+      });
       return;
     }
     let interruptedRunId: string | null = null;
@@ -3432,12 +3443,21 @@ export function issueRoutes(
         actorType: actor.actorType,
         actorId: actor.actorId,
       });
-    const hasUnresolvedFirstClassBlockers =
+    const commentDependencyReadiness =
       isBlocked && effectiveMoveToTodoRequested
-        ? (await svc.getDependencyReadiness(issue.id)).unresolvedBlockerCount > 0
-        : false;
+        ? await svc.getDependencyReadiness(issue.id)
+        : null;
+    const hasUnresolvedFirstClassBlockers = (commentDependencyReadiness?.unresolvedBlockerCount ?? 0) > 0;
     if (resumeRequested === true && isBlocked && hasUnresolvedFirstClassBlockers) {
-      res.status(409).json({ error: "Issue follow-up blocked by unresolved blockers" });
+      const unresolvedBlockers = await svc.getUnresolvedBlockerSummaries(issue.id);
+      res.status(409).json({
+        error: "Issue follow-up blocked by unresolved blockers",
+        details: {
+          issueId: issue.id,
+          unresolvedBlockerIssueIds: commentDependencyReadiness?.unresolvedBlockerIssueIds ?? [],
+          unresolvedBlockers,
+        },
+      });
       return;
     }
     let reopened = false;

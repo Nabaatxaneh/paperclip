@@ -811,9 +811,16 @@ type IssueRelationSummaryRow = {
   priority: string;
   assigneeAgentId: string | null;
   assigneeUserId: string | null;
+  /** Creator of the relation row (not the issue). Present only for blocked-by rows. */
+  relationCreatedByAgentId?: string | null;
+  relationCreatedByUserId?: string | null;
 };
 
 function summarizeIssueRelationRow(row: IssueRelationSummaryRow): IssueRelationIssueSummary {
+  const isSystemSpawned =
+    row.relationCreatedByAgentId != null && row.relationCreatedByUserId == null
+      ? true
+      : undefined;
   return {
     id: row.relatedId,
     identifier: row.identifier,
@@ -822,6 +829,7 @@ function summarizeIssueRelationRow(row: IssueRelationSummaryRow): IssueRelationI
     priority: row.priority as IssueRelationIssueSummary["priority"],
     assigneeAgentId: row.assigneeAgentId,
     assigneeUserId: row.assigneeUserId,
+    ...(isSystemSpawned !== undefined ? { isSystemSpawned } : {}),
   };
 }
 
@@ -1823,6 +1831,8 @@ export function issueService(db: Db) {
           priority: issues.priority,
           assigneeAgentId: issues.assigneeAgentId,
           assigneeUserId: issues.assigneeUserId,
+          relationCreatedByAgentId: issueRelations.createdByAgentId,
+          relationCreatedByUserId: issueRelations.createdByUserId,
         })
         .from(issueRelations)
         .innerJoin(issues, eq(issueRelations.issueId, issues.id))
@@ -2432,6 +2442,33 @@ export function issueService(db: Db) {
       if (!issue) throw notFound("Issue not found");
       const relations = await getIssueRelationSummaryMap(issue.companyId, [issueId], db);
       return relations.get(issueId) ?? { blockedBy: [], blocks: [] };
+    },
+
+    getUnresolvedBlockerSummaries: async (issueId: string) => {
+      const issue = await db
+        .select({ id: issues.id, companyId: issues.companyId })
+        .from(issues)
+        .where(eq(issues.id, issueId))
+        .then((rows) => rows[0] ?? null);
+      if (!issue) throw notFound("Issue not found");
+      const rows = await db
+        .select({
+          id: issueRelations.issueId,
+          identifier: issues.identifier,
+          title: issues.title,
+          status: issues.status,
+        })
+        .from(issueRelations)
+        .innerJoin(issues, eq(issueRelations.issueId, issues.id))
+        .where(
+          and(
+            eq(issueRelations.companyId, issue.companyId),
+            eq(issueRelations.type, "blocks"),
+            eq(issueRelations.relatedIssueId, issueId),
+            ne(issues.status, "done"),
+          ),
+        );
+      return rows.map((r) => ({ id: r.id, identifier: r.identifier, title: r.title, status: r.status }));
     },
 
     getDependencyReadiness: async (issueId: string, dbOrTx: any = db) => {

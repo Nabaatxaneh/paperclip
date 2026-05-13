@@ -74,5 +74,8 @@ export function errorHandler(
   const tc = getTelemetryClient();
   if (tc) trackErrorHandlerCrash(tc, { errorCode: rootError.name });
 
-  res.status(500).json({ error: "Internal server error" });
+  res.status(500).json({
+    error: "Internal server error",
+    details: { name: rootError.name ?? "UnknownError", message: rootError.message },
+  });
 }
