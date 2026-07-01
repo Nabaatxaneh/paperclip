@@ -7,6 +7,13 @@ import { withRecoveryModelProfileHint } from "./model-profile-hint.js";
 export const FINISH_SUCCESSFUL_RUN_HANDOFF_REASON = "finish_successful_run_handoff";
 export const SUCCESSFUL_RUN_MISSING_STATE_REASON = "successful_run_missing_state";
 export const DEFAULT_MAX_SUCCESSFUL_RUN_HANDOFF_ATTEMPTS = 1;
+// ALAA-1680 Track C: how many times one issue may re-trip the missing-disposition
+// handoff before Paperclip stops re-queuing the owner wake and hard-escalates to
+// the Board exactly once. This caps the "recovery echo" budget burn when an issue
+// keeps ending heartbeats in `in_progress` with no disposition. Counted on the
+// source-scoped `missing_disposition` recovery action's `attemptCount`, which
+// increments once per exhausted trip.
+export const MAX_MISSING_DISPOSITION_HANDOFF_TRIPS = 3;
 export const SUCCESSFUL_RUN_HANDOFF_REQUIRED_NOTICE_BODY =
   "Paperclip needs a disposition before this issue can continue.";
 export const SUCCESSFUL_RUN_HANDOFF_EXHAUSTED_NOTICE_BODY =
@@ -344,6 +351,11 @@ export function decideSuccessfulRunHandoff(input: {
   hasPauseHold: boolean;
   budgetBlocked: boolean;
   idempotentWakeExists: boolean;
+  // ALAA-1680 Track C: when the issue's missing-disposition recovery has already
+  // been hard-escalated to the Board (>= MAX_MISSING_DISPOSITION_HANDOFF_TRIPS),
+  // stop generating fresh corrective wakes for new source runs. The Board owns
+  // the ambiguity; another corrective wake would just re-burn budget.
+  missingDispositionBoardEscalated?: boolean;
 }): SuccessfulRunHandoffDecision {
   const { run, issue, agent } = input;
 
@@ -377,6 +389,9 @@ export function decideSuccessfulRunHandoff(input: {
   }
   if (input.hasExplicitBlockerPath) return { kind: "skip", reason: "explicit blocker path owns the next action" };
   if (input.hasOpenRecoveryIssue) return { kind: "skip", reason: "open recovery issue owns the ambiguity" };
+  if (input.missingDispositionBoardEscalated) {
+    return { kind: "skip", reason: "missing disposition already hard-escalated to the board" };
+  }
   if (input.hasPauseHold) return { kind: "skip", reason: "issue is under an active pause hold" };
   if (input.budgetBlocked) return { kind: "skip", reason: "budget hard stop blocks corrective wake" };
   if (input.idempotentWakeExists) {
@@ -419,5 +434,59 @@ export function decideSuccessfulRunHandoff(input: {
       wakeReason: FINISH_SUCCESSFUL_RUN_HANDOFF_REASON,
       livenessState: input.livenessState,
     }, "status_only"),
+  };
+}
+
+// ALAA-1680 Tracks B+C: pure decision for what to do when a missing-disposition
+// handoff is exhausted (the source run succeeded, the one corrective wake also
+// left the issue in `in_progress` with no disposition). Kept pure so both the
+// self-heal and the anti-loop guardrail are unit-testable without a database.
+export type MissingDispositionExhaustionOutcome =
+  | { kind: "auto_resolve_done"; reason: string }
+  | { kind: "board_hard_escalate"; reason: string; firstEscalation: boolean }
+  | { kind: "escalate_owner"; reason: string };
+
+export function decideMissingDispositionExhaustionOutcome(input: {
+  // The source run's own liveness snapshot (carried into the corrective wake
+  // context). "completed" means the run self-reported it finished the issue's
+  // work; it just never recorded a disposition.
+  sourceLivenessState: RunLivenessState | null;
+  // The source-scoped `missing_disposition` recovery action's attemptCount,
+  // i.e. how many times this issue has re-tripped the handoff (>= 1).
+  recoveryAttemptCount: number;
+  maxTrips?: number;
+}): MissingDispositionExhaustionOutcome {
+  const maxTrips = input.maxTrips ?? MAX_MISSING_DISPOSITION_HANDOFF_TRIPS;
+
+  // Track B — auto-heal (no human). The source run reported its work complete
+  // but never recorded a disposition, and the one corrective wake did not fix
+  // it either. Rather than block on a human `→ todo` flip, record the effective
+  // outcome and move the issue to `done`.
+  if (input.sourceLivenessState === "completed") {
+    return {
+      kind: "auto_resolve_done",
+      reason: "source run reported completed work; auto-resolving missing disposition to done",
+    };
+  }
+
+  // Track C — anti-pathological-loop guardrail. The same issue keeps re-tripping
+  // the handoff. Stop re-queuing the owner wake and hard-escalate to the Board
+  // exactly once (on the trip that crosses the limit) to cap the echo + budget
+  // burn.
+  if (input.recoveryAttemptCount >= maxTrips) {
+    return {
+      kind: "board_hard_escalate",
+      reason:
+        `missing disposition re-tripped ${input.recoveryAttemptCount} time(s) (limit ${maxTrips}); ` +
+        "board hard-escalation, owner wakes suppressed",
+      firstEscalation: input.recoveryAttemptCount === maxTrips,
+    };
+  }
+
+  // Default — one more owner wake so the assignee (or its manager) can record a
+  // disposition. This is the existing behavior.
+  return {
+    kind: "escalate_owner",
+    reason: "missing disposition unresolved; waking recovery owner to record a disposition",
   };
 }

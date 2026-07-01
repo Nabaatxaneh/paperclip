@@ -1,12 +1,14 @@
 import { describe, expect, it } from "vitest";
 import {
   FINISH_SUCCESSFUL_RUN_HANDOFF_REASON,
+  MAX_MISSING_DISPOSITION_HANDOFF_TRIPS,
   SUCCESSFUL_RUN_HANDOFF_EXHAUSTED_NOTICE_BODY,
   SUCCESSFUL_RUN_HANDOFF_REQUIRED_NOTICE_BODY,
   SUCCESSFUL_RUN_MISSING_STATE_REASON,
   buildFinishSuccessfulRunHandoffIdempotencyKey,
   buildSuccessfulRunHandoffExhaustedNotice,
   buildSuccessfulRunHandoffRequiredNotice,
+  decideMissingDispositionExhaustionOutcome,
   decideSuccessfulRunHandoff,
   isIdempotentFinishSuccessfulRunHandoffWakeStatus,
   isSuccessfulRunHandoffRequiredNoticeBody,
@@ -117,6 +119,15 @@ describe("successful run handoff decision", () => {
       kind: "skip",
       reason: "issue already has an active execution path",
     });
+  });
+
+  it("does not queue a fresh corrective wake once the missing disposition is board hard-escalated (ALAA-1680 Track C)", () => {
+    expect(decide({ missingDispositionBoardEscalated: true })).toEqual({
+      kind: "skip",
+      reason: "missing disposition already hard-escalated to the board",
+    });
+    // default (undefined) still enqueues normally
+    expect(decide().kind).toBe("enqueue");
   });
 
   it("does not queue when another wake or dependency path already owns the next action", () => {
@@ -303,5 +314,70 @@ describe("successful run handoff decision", () => {
     expect(isSuccessfulRunHandoffRequiredNoticeBody("## Successful run missing issue disposition\n\nold body")).toBe(true);
     expect(isSuccessfulRunHandoffRequiredNoticeBody("## This issue still needs a next step\n\nold body")).toBe(true);
     expect(isSuccessfulRunHandoffRequiredNoticeBody("Unrelated comment")).toBe(false);
+  });
+});
+
+describe("missing disposition exhaustion outcome (ALAA-1680 Tracks B+C)", () => {
+  it("Track B: auto-resolves to done when the source run reported completed work", () => {
+    expect(
+      decideMissingDispositionExhaustionOutcome({
+        sourceLivenessState: "completed",
+        recoveryAttemptCount: 1,
+      }),
+    ).toEqual({
+      kind: "auto_resolve_done",
+      reason: "source run reported completed work; auto-resolving missing disposition to done",
+    });
+  });
+
+  it("Track B takes priority over the trip limit when the work is complete", () => {
+    // Even a pathological trip count auto-resolves if the source work is complete.
+    expect(
+      decideMissingDispositionExhaustionOutcome({
+        sourceLivenessState: "completed",
+        recoveryAttemptCount: MAX_MISSING_DISPOSITION_HANDOFF_TRIPS + 5,
+      }).kind,
+    ).toBe("auto_resolve_done");
+  });
+
+  it("wakes the owner for a non-completed run below the trip limit", () => {
+    const outcome = decideMissingDispositionExhaustionOutcome({
+      sourceLivenessState: "advanced",
+      recoveryAttemptCount: 1,
+    });
+    expect(outcome.kind).toBe("escalate_owner");
+  });
+
+  it("Track C: hard-escalates to the Board once when the trip limit is reached", () => {
+    const outcome = decideMissingDispositionExhaustionOutcome({
+      sourceLivenessState: "advanced",
+      recoveryAttemptCount: MAX_MISSING_DISPOSITION_HANDOFF_TRIPS,
+    });
+    expect(outcome).toMatchObject({ kind: "board_hard_escalate", firstEscalation: true });
+  });
+
+  it("Track C: keeps suppressing owner wakes past the limit but does not re-escalate", () => {
+    const outcome = decideMissingDispositionExhaustionOutcome({
+      sourceLivenessState: "needs_followup",
+      recoveryAttemptCount: MAX_MISSING_DISPOSITION_HANDOFF_TRIPS + 2,
+    });
+    expect(outcome).toMatchObject({ kind: "board_hard_escalate", firstEscalation: false });
+  });
+
+  it("honors an explicit maxTrips override", () => {
+    expect(
+      decideMissingDispositionExhaustionOutcome({
+        sourceLivenessState: "advanced",
+        recoveryAttemptCount: 2,
+        maxTrips: 2,
+      }),
+    ).toMatchObject({ kind: "board_hard_escalate", firstEscalation: true });
+    expect(
+      decideMissingDispositionExhaustionOutcome({
+        sourceLivenessState: "advanced",
+        recoveryAttemptCount: 1,
+        maxTrips: 2,
+      }).kind,
+    ).toBe("escalate_owner");
   });
 });

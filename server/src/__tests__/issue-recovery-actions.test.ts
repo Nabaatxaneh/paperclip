@@ -25,6 +25,10 @@ import { errorHandler } from "../middleware/index.js";
 import { issueRoutes } from "../routes/issues.js";
 import { issueRecoveryActionService } from "../services/issue-recovery-actions.js";
 import { recoveryService } from "../services/recovery/service.js";
+import {
+  MAX_MISSING_DISPOSITION_HANDOFF_TRIPS,
+  SUCCESSFUL_RUN_MISSING_STATE_REASON,
+} from "../services/recovery/index.js";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
@@ -325,6 +329,121 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       sourceIssueId: sourceIssue.id,
       recoveryCause: "stranded_assigned_issue",
     });
+  });
+
+  it("ALAA-1680 Track B: auto-resolves a completed-work missing disposition to done without waking a human", async () => {
+    const { companyId, coderId, sourceIssue } = await seedCompany();
+    const enqueueWakeup = vi.fn(async () => null);
+    const recovery = recoveryService(db, { enqueueWakeup });
+    const correctiveRunId = randomUUID();
+    const latestRun = {
+      id: correctiveRunId,
+      agentId: coderId,
+      status: "succeeded",
+      error: null,
+      errorCode: null,
+      contextSnapshot: {
+        wakeReason: "finish_successful_run_handoff",
+        handoffRequired: true,
+        handoffAttempt: 1,
+        maxHandoffAttempts: 1,
+        livenessState: "completed",
+      },
+      livenessState: "completed",
+    } as const;
+
+    const updated = await recovery.escalateStrandedAssignedIssue({
+      issue: sourceIssue,
+      previousStatus: "in_progress",
+      latestRun,
+      recoveryCause: SUCCESSFUL_RUN_MISSING_STATE_REASON,
+      successfulRunHandoffEvidence: {
+        sourceRunId: randomUUID(),
+        correctiveRunId,
+        missingDisposition: "clear_next_step",
+        handoffAttempt: 1,
+        maxHandoffAttempts: 1,
+        sourceLivenessState: "completed",
+      },
+    });
+
+    expect(updated?.status).toBe("done");
+    // No owner wake — the whole point of Track B is self-heal without a human.
+    expect(enqueueWakeup).not.toHaveBeenCalled();
+
+    const [issueRow] = await db.select().from(issues).where(eq(issues.id, sourceIssue.id));
+    expect(issueRow?.status).toBe("done");
+
+    const actionRows = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(eq(issueRecoveryActions.sourceIssueId, sourceIssue.id));
+    expect(actionRows).toHaveLength(1);
+    expect(actionRows[0]).toMatchObject({ status: "resolved", outcome: "restored" });
+
+    const comments = await db.select().from(issueComments).where(eq(issueComments.issueId, sourceIssue.id));
+    expect(comments.some((c) => (c.body ?? "").includes("auto-resolved this issue's missing disposition"))).toBe(true);
+  });
+
+  it("ALAA-1680 Track C: hard-escalates to the Board once and stops owner wakes after the trip limit", async () => {
+    const { coderId, sourceIssue } = await seedCompany();
+    const enqueueWakeup = vi.fn(async () => null);
+    const recovery = recoveryService(db, { enqueueWakeup });
+    const buildLatestRun = () => ({
+      id: randomUUID(),
+      agentId: coderId,
+      status: "succeeded",
+      error: null,
+      errorCode: null,
+      contextSnapshot: {
+        wakeReason: "finish_successful_run_handoff",
+        handoffRequired: true,
+        handoffAttempt: 1,
+        maxHandoffAttempts: 1,
+        livenessState: "advanced",
+      },
+      livenessState: "advanced",
+    } as const);
+
+    // Re-trip the missing-disposition handoff MAX times. Only the first
+    // MAX_MISSING_DISPOSITION_HANDOFF_TRIPS - 1 trips wake an owner; the trip
+    // that reaches the limit hard-escalates to the Board and suppresses the wake.
+    for (let i = 0; i < MAX_MISSING_DISPOSITION_HANDOFF_TRIPS; i += 1) {
+      await recovery.escalateStrandedAssignedIssue({
+        issue: sourceIssue,
+        previousStatus: "in_progress",
+        latestRun: buildLatestRun(),
+        recoveryCause: SUCCESSFUL_RUN_MISSING_STATE_REASON,
+        successfulRunHandoffEvidence: {
+          sourceRunId: randomUUID(),
+          correctiveRunId: randomUUID(),
+          missingDisposition: "clear_next_step",
+          handoffAttempt: 1,
+          maxHandoffAttempts: 1,
+          sourceLivenessState: "advanced",
+        },
+      });
+    }
+
+    const actionRows = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(eq(issueRecoveryActions.sourceIssueId, sourceIssue.id));
+    expect(actionRows).toHaveLength(1);
+    expect(actionRows[0]).toMatchObject({
+      kind: "missing_disposition",
+      attemptCount: MAX_MISSING_DISPOSITION_HANDOFF_TRIPS,
+    });
+
+    // Owner woken on every trip below the limit, but NOT on the limit trip.
+    expect(enqueueWakeup).toHaveBeenCalledTimes(MAX_MISSING_DISPOSITION_HANDOFF_TRIPS - 1);
+
+    const comments = await db.select().from(issueComments).where(eq(issueComments.issueId, sourceIssue.id));
+    const boardEscalations = comments.filter((c) =>
+      (c.body ?? "").includes("Missing-disposition recovery: Board hard-escalation"),
+    );
+    // Escalate to the Board exactly once, not every cycle.
+    expect(boardEscalations).toHaveLength(1);
   });
 
   it("reuses the same source-scoped action when latest run IDs change while the cause stays the same", async () => {

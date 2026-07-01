@@ -6,6 +6,7 @@ import {
   MIN_ISSUE_GRAPH_LIVENESS_AUTO_RECOVERY_LOOKBACK_HOURS,
   type IssueGraphLivenessAutoRecoveryPreview,
   type IssueGraphLivenessAutoRecoveryPreviewItem,
+  type RunLivenessState,
 } from "@paperclipai/shared";
 import {
   agents,
@@ -40,9 +41,11 @@ import { evaluateAgentInvokabilityFromDb } from "../agent-invokability.js";
 import { getRunLogStore } from "../run-log-store.js";
 import {
   DEFAULT_MAX_SUCCESSFUL_RUN_HANDOFF_ATTEMPTS,
+  MAX_MISSING_DISPOSITION_HANDOFF_TRIPS,
   FINISH_SUCCESSFUL_RUN_HANDOFF_REASON,
   SUCCESSFUL_RUN_MISSING_STATE_REASON,
   buildSuccessfulRunHandoffExhaustedNotice,
+  decideMissingDispositionExhaustionOutcome,
   noticeMetadataReferencesRecoveryAction,
   type SuccessfulRunHandoffNotice,
 } from "./successful-run-handoff.js";
@@ -114,6 +117,10 @@ type SuccessfulRunHandoffRecoveryEvidence = {
   missingDisposition: string;
   handoffAttempt: number;
   maxHandoffAttempts: number;
+  // ALAA-1680 Track B: the source run's own liveness snapshot, carried into the
+  // corrective wake context by decideSuccessfulRunHandoff. "completed" means the
+  // run reported it finished the issue's work → eligible for auto-heal to `done`.
+  sourceLivenessState: RunLivenessState | null;
 };
 
 type WatchdogDecisionActor =
@@ -229,12 +236,14 @@ function successfulRunHandoffRecoveryEvidence(latestRun: LatestIssueRun): Succes
     context.maxHandoffAttempts,
     DEFAULT_MAX_SUCCESSFUL_RUN_HANDOFF_ATTEMPTS,
   );
+  const sourceLivenessState = readNonEmptyString(context.livenessState) as RunLivenessState | null;
   return {
     sourceRunId: readNonEmptyString(context.sourceRunId) ?? readNonEmptyString(context.resumeFromRunId),
     correctiveRunId: latestRun.id,
     missingDisposition: readNonEmptyString(context.missingDisposition) ?? "clear_next_step",
     handoffAttempt,
     maxHandoffAttempts,
+    sourceLivenessState,
   };
 }
 
@@ -2306,6 +2315,164 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       .then((rows) => rows.map((row) => row.blockerIssueId));
   }
 
+  // ALAA-1680: has a prior system comment on this issue whose body contains the
+  // given marker (or metadata references the recovery action). Used to keep the
+  // auto-heal / hard-escalation notices one-time.
+  async function hasSystemCommentMatching(
+    issueId: string,
+    predicate: (row: { body: string | null; metadata: unknown }) => boolean,
+  ) {
+    return db
+      .select({ body: issueComments.body, metadata: issueComments.metadata })
+      .from(issueComments)
+      .where(and(eq(issueComments.issueId, issueId), eq(issueComments.authorType, "system")))
+      .orderBy(desc(issueComments.createdAt))
+      .limit(50)
+      .then((rows) => rows.some((row) => predicate(row)));
+  }
+
+  // ALAA-1680 Track B: auto-heal a missing-disposition handoff whose source run
+  // reported completed work. Records the effective outcome (`done`), resolves the
+  // recovery action, and posts a single system note — no human `→ todo` flip.
+  async function autoResolveCompletedMissingDisposition(input: {
+    issue: typeof issues.$inferSelect;
+    latestRun: LatestIssueRun;
+    recoveryAction: Awaited<ReturnType<typeof recoveryActionsSvc.upsertSourceScoped>>;
+    evidence: SuccessfulRunHandoffRecoveryEvidence | null;
+    reason: string;
+  }) {
+    const updated = await issuesSvc.update(input.issue.id, { status: "done" });
+    if (!updated) return null;
+
+    await recoveryActionsSvc.resolveActiveForIssue({
+      companyId: input.issue.companyId,
+      sourceIssueId: input.issue.id,
+      actionId: input.recoveryAction.id,
+      status: "resolved",
+      outcome: "restored",
+      resolutionNote: input.reason,
+    });
+
+    const marker = `Recovery action: \`${input.recoveryAction.id}\``;
+    const already = await hasSystemCommentMatching(input.issue.id, (row) =>
+      (row.body ?? "").includes("Paperclip auto-resolved this issue's missing disposition"),
+    );
+    if (!already) {
+      await issuesSvc.addComment(
+        input.issue.id,
+        [
+          "Paperclip auto-resolved this issue's missing disposition.",
+          "",
+          "The successful source run reported its work **completed**, but neither the run nor its one corrective wake recorded a disposition. Rather than block on a human `→ todo` flip, Paperclip recorded the effective outcome and moved the issue to `done`.",
+          "",
+          `- Source run: \`${input.evidence?.sourceRunId ?? "unknown"}\``,
+          `- Corrective run: \`${input.evidence?.correctiveRunId ?? input.latestRun?.id ?? "unknown"}\``,
+          `- ${marker}`,
+          "- If this close was wrong, reopen the issue and record the intended disposition.",
+        ].join("\n"),
+        {},
+        { authorType: "system" },
+      );
+    }
+
+    await logActivity(db, {
+      companyId: input.issue.companyId,
+      actorType: "system",
+      actorId: "system",
+      agentId: null,
+      runId: null,
+      action: "issue.successful_run_handoff_auto_resolved",
+      entityType: "issue",
+      entityId: input.issue.id,
+      details: {
+        identifier: input.issue.identifier,
+        status: "done",
+        previousStatus: "in_progress",
+        source: "recovery.auto_resolve_completed_missing_disposition",
+        recoveryActionId: input.recoveryAction.id,
+        recoveryActionAttemptCount: input.recoveryAction.attemptCount,
+        sourceRunId: input.evidence?.sourceRunId ?? null,
+        correctiveRunId: input.evidence?.correctiveRunId ?? input.latestRun?.id ?? null,
+        sourceLivenessState: input.evidence?.sourceLivenessState ?? null,
+      },
+    });
+
+    return updated;
+  }
+
+  // ALAA-1680 Track C: the issue has re-tripped the missing-disposition handoff
+  // too many times. Stop re-queuing the owner wake (the caller must not enqueue
+  // one) and hard-escalate to the Board exactly once. The issue is parked at
+  // `blocked` (with first-class blockers) or `todo` (ALAA-965 fallback), never
+  // status=`blocked` with an empty blockedBy[].
+  async function boardHardEscalateMissingDisposition(input: {
+    issue: typeof issues.$inferSelect;
+    latestRun: LatestIssueRun;
+    recoveryAction: Awaited<ReturnType<typeof recoveryActionsSvc.upsertSourceScoped>>;
+    evidence: SuccessfulRunHandoffRecoveryEvidence | null;
+    firstEscalation: boolean;
+  }) {
+    const blockerIds = await existingUnresolvedBlockerIssueIds(input.issue.companyId, input.issue.id);
+    const initialStatus: "blocked" | "todo" = blockerIds.length > 0 ? "blocked" : "todo";
+    const updated = await issuesSvc.update(input.issue.id, {
+      status: initialStatus,
+      blockedByIssueIds: blockerIds,
+      assigneeAgentId: input.recoveryAction.ownerAgentId ?? input.issue.assigneeAgentId,
+    });
+    if (!updated) return null;
+
+    const escalationHeading = "## Missing-disposition recovery: Board hard-escalation";
+    if (input.firstEscalation) {
+      const already = await hasSystemCommentMatching(input.issue.id, (row) =>
+        (row.body ?? "").includes(escalationHeading),
+      );
+      if (!already) {
+        await issuesSvc.addComment(
+          input.issue.id,
+          [
+            escalationHeading,
+            "",
+            `This issue has re-tripped the missing-disposition handoff ${input.recoveryAction.attemptCount} times ` +
+              `(limit ${MAX_MISSING_DISPOSITION_HANDOFF_TRIPS}). To stop an infinite recovery echo and cap budget ` +
+              "burn, Paperclip has stopped re-queuing the owner recovery wake and is escalating to the Board once.",
+            "",
+            `- Recovery action: \`${input.recoveryAction.id}\``,
+            `- Trips: ${input.recoveryAction.attemptCount} (limit ${MAX_MISSING_DISPOSITION_HANDOFF_TRIPS})`,
+            `- Latest source run: \`${input.evidence?.sourceRunId ?? "unknown"}\``,
+            "- Board next action: assign an invokable owner, record the intended disposition, or cancel the issue. " +
+              "Automatic owner wakes and fresh corrective wakes are suppressed until this is resolved.",
+          ].join("\n"),
+          {},
+          { authorType: "system" },
+        );
+      }
+    }
+
+    await logActivity(db, {
+      companyId: input.issue.companyId,
+      actorType: "system",
+      actorId: "system",
+      agentId: null,
+      runId: null,
+      action: "issue.successful_run_handoff_board_hard_escalated",
+      entityType: "issue",
+      entityId: input.issue.id,
+      details: {
+        identifier: input.issue.identifier,
+        status: initialStatus,
+        previousStatus: "in_progress",
+        source: "recovery.board_hard_escalate_missing_disposition",
+        recoveryActionId: input.recoveryAction.id,
+        trips: input.recoveryAction.attemptCount,
+        maxTrips: MAX_MISSING_DISPOSITION_HANDOFF_TRIPS,
+        firstEscalation: input.firstEscalation,
+        blockerIssueIds: blockerIds,
+      },
+    });
+
+    return updated;
+  }
+
   async function escalateStrandedAssignedIssue(input: {
     issue: typeof issues.$inferSelect;
     previousStatus: "todo" | "in_progress";
@@ -2330,6 +2497,39 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       recoveryCause,
       successfulRunHandoffEvidence: input.successfulRunHandoffEvidence,
     });
+
+    // ALAA-1680 Tracks B+C: platform-side self-heal for the missing-disposition
+    // handoff. The guard itself (decideSuccessfulRunHandoff) stays; this decides
+    // what to do once it is exhausted so a single missed disposition never needs
+    // a human, and a pathological re-trip loop escalates once instead of echoing.
+    if (recoveryCause === SUCCESSFUL_RUN_MISSING_STATE_REASON) {
+      const outcome = decideMissingDispositionExhaustionOutcome({
+        sourceLivenessState: input.successfulRunHandoffEvidence?.sourceLivenessState ?? null,
+        recoveryAttemptCount: recoveryAction.attemptCount,
+      });
+      if (outcome.kind === "auto_resolve_done") {
+        return autoResolveCompletedMissingDisposition({
+          issue: input.issue,
+          latestRun: input.latestRun,
+          recoveryAction,
+          evidence: input.successfulRunHandoffEvidence ?? null,
+          reason: outcome.reason,
+        });
+      }
+      if (outcome.kind === "board_hard_escalate") {
+        // Intentionally does NOT enqueue a source-scoped owner wake — the Board
+        // now owns this. Fresh corrective wakes are also suppressed upstream via
+        // decideSuccessfulRunHandoff(missingDispositionBoardEscalated).
+        return boardHardEscalateMissingDisposition({
+          issue: input.issue,
+          latestRun: input.latestRun,
+          recoveryAction,
+          evidence: input.successfulRunHandoffEvidence ?? null,
+          firstEscalation: outcome.firstEscalation,
+        });
+      }
+    }
+
     const blockerIds = await existingUnresolvedBlockerIssueIds(input.issue.companyId, input.issue.id);
     // ALAA-965: never produce status=blocked with empty blockedBy[]. The
     // Board UI footer ("Work on this issue is blocked until it is moved back
