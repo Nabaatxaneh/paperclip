@@ -28,6 +28,7 @@ import { redactCurrentUserText } from "../../log-redaction.js";
 import { redactSensitiveText } from "../../redaction.js";
 import { logActivity } from "../activity-log.js";
 import { budgetService } from "../budgets.js";
+import { BILLING_LIMIT_ERROR_CODE } from "../heartbeat-stop-metadata.js";
 import { instanceSettingsService } from "../instance-settings.js";
 import { issueTreeControlService } from "../issue-tree-control.js";
 import { issueService } from "../issues.js";
@@ -120,6 +121,15 @@ function didAutomaticRecoveryFail(
     UNSUCCESSFUL_HEARTBEAT_RUN_TERMINAL_STATUSES.includes(
       latestRun.status as (typeof UNSUCCESSFUL_HEARTBEAT_RUN_TERMINAL_STATUSES)[number],
     );
+}
+
+// ALAA-1613 R2: workspace spend-limit / billing failures are non-retryable.
+// Immediately re-running a billing-blocked agent just re-fails and burns the
+// workspace cap (the ALAA-1608 spend-exhaust failover cascade). master lacks
+// the upstream retry-streak-by-failure-cause classifier (#7031), so this is
+// the minimal billing-only guard consulted before recovery re-enqueues a run.
+function isNonRetryableBillingFailure(latestRun: LatestIssueRun): boolean {
+  return readNonEmptyString(latestRun?.errorCode) === BILLING_LIMIT_ERROR_CODE;
 }
 
 function issueIdFromRunContext(contextSnapshot: unknown) {
@@ -1679,6 +1689,13 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
           continue;
         }
 
+        // ALAA-1613 R2: do not auto-retry dispatch after a billing/spend-limit
+        // failure — it only re-fails and burns the workspace cap.
+        if (isNonRetryableBillingFailure(latestRun)) {
+          result.skipped += 1;
+          continue;
+        }
+
         if (await isInvocationBudgetBlocked(issue, agentId)) {
           result.skipped += 1;
           continue;
@@ -1731,6 +1748,13 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         } else {
           result.skipped += 1;
         }
+        continue;
+      }
+
+      // ALAA-1613 R2: do not auto-retry continuation after a billing/spend-limit
+      // failure — it only re-fails and burns the workspace cap.
+      if (isNonRetryableBillingFailure(latestRun)) {
+        result.skipped += 1;
         continue;
       }
 

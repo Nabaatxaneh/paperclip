@@ -67,6 +67,8 @@ import {
 } from "./heartbeat-run-summary.js";
 import {
   buildHeartbeatRunStopMetadata,
+  isBillingLimitErrorMessage,
+  BILLING_LIMIT_ERROR_CODE,
   mergeHeartbeatRunStopMetadata,
 } from "./heartbeat-stop-metadata.js";
 import {
@@ -1527,7 +1529,16 @@ export function shouldResetTaskSessionForWake(
     // session toward the 64k compaction threshold (observed in CEO run
     // 292a5fd1, where timer wakes repeatedly bloated a long-lived manager
     // session). Reset on every timer wake so each interval starts fresh.
-    wakeReason === "heartbeat_timer"
+    wakeReason === "heartbeat_timer" ||
+    // ALAA-1613 R3: routine re-checks (monitor wakes, stranded-issue recovery)
+    // do not carry meaningful continuation state — the agent re-reads the issue
+    // thread from the API on each run. Reusing the prior task session for these
+    // paths accumulates 2-5.5M cached-input tokens re-sent per run at
+    // $0.7-1.76/run. Starting fresh caps the context at ~100-300K tokens
+    // (system prompt + wake payload + fetched issue thread).
+    wakeReason === "issue_monitor_due" ||
+    wakeReason === "issue_assignment_recovery" ||
+    wakeReason === "issue_continuation_needed"
   ) {
     return true;
   }
@@ -1605,6 +1616,10 @@ export function describeSessionResetReason(
   // PF-4: paired with shouldResetTaskSessionForWake — keep the reason wording
   // explicit so run logs make session reuse/reset behavior legible.
   if (wakeReason === "heartbeat_timer") return "wake reason is heartbeat_timer (timer-driven wake starts fresh)";
+  // ALAA-1613 R3: routine re-checks start fresh to cap cached-input token cost.
+  if (wakeReason === "issue_monitor_due") return "wake reason is issue_monitor_due (routine re-check starts fresh)";
+  if (wakeReason === "issue_assignment_recovery") return "wake reason is issue_assignment_recovery (recovery re-check starts fresh)";
+  if (wakeReason === "issue_continuation_needed") return "wake reason is issue_continuation_needed (continuation re-check starts fresh)";
   return null;
 }
 
@@ -5912,9 +5927,12 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           ? "timeout"
           : outcome === "cancelled"
             ? (latestRun?.errorCode ?? "cancelled")
-            : outcome === "failed"
-              ? (adapterResult.errorCode ?? "adapter_failed")
-              : null;
+          : outcome === "failed"
+            ? (adapterResult.errorCode
+              ?? (isBillingLimitErrorMessage(adapterResult.errorMessage)
+                ? BILLING_LIMIT_ERROR_CODE
+                : "adapter_failed"))
+            : null;
 
       let logSummary: { bytes: number; sha256?: string; compressed: boolean } | null = null;
       if (handle) {
@@ -6015,6 +6033,11 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         });
         const livenessRun = finalizedRun;
         await refreshContinuationSummaryForRun(livenessRun, agent);
+        // ALAA-1613 R2: billing/spend-limit failures are surfaced via the
+        // `billing_limit_exhausted` errorCode (set above) and treated as
+        // non-retryable by the recovery sweep. master predates the issue-monitor
+        // (`monitorNextCheckAt`) feature, so there is no monitor to clear here;
+        // recovery's non-retryable guard is what breaks the futile re-wake loop.
         if (issueId && outcome === "succeeded") {
           try {
             const existingRunComment = await findRunIssueComment(livenessRun.id, livenessRun.companyId, issueId);
@@ -6069,6 +6092,13 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         err instanceof Error ? err.message : "Unknown adapter failure",
         await getCurrentUserRedactionOptions(),
       );
+      // ALAA-1613 R2: classify workspace spend-limit/billing failures as a
+      // distinct non-retryable error code so recovery does not auto-retry them.
+      // (master lacks the upstream workspace-validation failure classifier, so
+      // this adapts to billing detection only.)
+      const failureErrorCode = isBillingLimitErrorMessage(message)
+        ? BILLING_LIMIT_ERROR_CODE
+        : "adapter_failed";
       logger.error({ err, runId }, "heartbeat execution failed");
 
       let logSummary: { bytes: number; sha256?: string; compressed: boolean } | null = null;
@@ -6089,10 +6119,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
       const failedRun = await setRunStatus(run.id, "failed", {
         error: message,
-        errorCode: "adapter_failed",
+        errorCode: failureErrorCode,
         finishedAt: new Date(),
         resultJson: mergeRunStopMetadataForAgent(agent, "failed", {
-          errorCode: "adapter_failed",
+          errorCode: failureErrorCode,
           errorMessage: message,
         }),
         stdoutExcerpt,
@@ -6148,14 +6178,17 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           // The inner catch did not fire, so we must record the failure here.
           const message = outerErr instanceof Error ? outerErr.message : "Unknown setup failure";
           logger.error({ err: outerErr, runId }, "heartbeat execution setup failed");
+          const setupFailureErrorCode = isBillingLimitErrorMessage(message)
+            ? BILLING_LIMIT_ERROR_CODE
+            : "adapter_failed";
           const setupFailureAgent = await getAgent(run.agentId).catch(() => null);
           await setRunStatus(runId, "failed", {
             error: message,
-            errorCode: "adapter_failed",
+            errorCode: setupFailureErrorCode,
             finishedAt: new Date(),
             ...(setupFailureAgent ? {
               resultJson: mergeRunStopMetadataForAgent(setupFailureAgent, "failed", {
-                errorCode: "adapter_failed",
+                errorCode: setupFailureErrorCode,
                 errorMessage: message,
               }),
             } : {}),
