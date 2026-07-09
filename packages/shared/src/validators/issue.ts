@@ -185,6 +185,15 @@ export const updateIssueSchema = createIssueSchema.partial().extend({
   resume: z.boolean().optional(),
   interrupt: z.boolean().optional(),
   hiddenAt: z.string().datetime().nullable().optional(),
+  // ALAA-1888: activation dependency for ALAA-1882. Agents park a time-/event-gated
+  // issue by PATCHing a future ISO instant here (ALAA-1681 §A1/§A2); the recovery
+  // guards then honor it as a valid waiting path and suppress missing-disposition
+  // churn until it passes. `null` clears the park (e.g. the ALAA-1677 R2
+  // clear-on-billing-limit path). Values more than MONITOR_PARK_MAX_HORIZON_MS (7d)
+  // out are accepted but INERT: isMonitorParkActive() ignores them, so a stale
+  // far-future monitor cannot park an issue indefinitely — the guard is the single
+  // source of bounding truth, so no time-dependent clamp is applied here.
+  monitorNextCheckAt: z.string().datetime().nullable().optional(),
 });
 
 export type UpdateIssue = z.infer<typeof updateIssueSchema>;

@@ -1953,6 +1953,7 @@ export function issueRoutes(
       resume: resumeRequested,
       interrupt: interruptRequested,
       hiddenAt: hiddenAtRaw,
+      monitorNextCheckAt: monitorNextCheckAtRaw,
       ...updateFields
     } = req.body;
     const shouldCancelActiveRunForCancelledStatus =
@@ -2044,6 +2045,13 @@ export function issueRoutes(
 
     if (hiddenAtRaw !== undefined) {
       updateFields.hiddenAt = hiddenAtRaw ? new Date(hiddenAtRaw) : null;
+    }
+    // ALAA-1888: persist the monitor park (ALAA-1882 signal). The validator keeps this
+    // as an ISO string; the DB column is a timestamp, so convert to Date. `null` clears
+    // the park (e.g. ALAA-1677 R2 clear-on-billing-limit). Horizon bounding is enforced
+    // by isMonitorParkActive() at read time, not clamped here.
+    if (monitorNextCheckAtRaw !== undefined) {
+      updateFields.monitorNextCheckAt = monitorNextCheckAtRaw ? new Date(monitorNextCheckAtRaw) : null;
     }
     if (
       commentBody &&
