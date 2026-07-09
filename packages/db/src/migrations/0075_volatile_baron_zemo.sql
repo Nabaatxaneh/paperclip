@@ -1,0 +1,1 @@
+ALTER TABLE "issues" ADD COLUMN "monitor_next_check_at" timestamp with time zone;

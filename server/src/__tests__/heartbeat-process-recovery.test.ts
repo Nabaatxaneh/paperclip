@@ -1613,6 +1613,56 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     expect(comments[0]?.body).toContain(`Recovery issue: [${recovery.identifier}]`);
   });
 
+  it("suppresses stranded reconcile for an in_progress issue parked to a future monitor (ALAA-1882)", async () => {
+    const { companyId, issueId } = await seedStrandedIssueFixture({
+      status: "in_progress",
+      runStatus: "succeeded",
+      livenessState: "empty_response",
+    });
+    await db
+      .update(issues)
+      .set({ monitorNextCheckAt: new Date(Date.now() + 60 * 60 * 1000) })
+      .where(eq(issues.id, issueId));
+
+    const result = await heartbeatService(db).reconcileStrandedAssignedIssues();
+
+    expect(result.monitorParkSuppressed).toBe(1);
+    expect(result.successfulContinuationObserved).toBe(0);
+    expect(result.continuationRequeued).toBe(0);
+    expect(result.escalated).toBe(0);
+
+    const recoveries = await db
+      .select()
+      .from(issues)
+      .where(and(eq(issues.companyId, companyId), eq(issues.originKind, "stranded_issue_recovery")));
+    expect(recoveries).toHaveLength(0);
+
+    const events = await db
+      .select()
+      .from(activityLog)
+      .where(and(eq(activityLog.companyId, companyId), eq(activityLog.action, "recovery.monitor_park_suppressed")));
+    expect(events).toHaveLength(1);
+    expect(events[0]?.entityId).toBe(issueId);
+  });
+
+  it("does not mask a genuine terminal failure on a monitor-parked in_progress issue (ALAA-1882)", async () => {
+    const { issueId } = await seedStrandedIssueFixture({
+      status: "in_progress",
+      runStatus: "failed",
+    });
+    await db
+      .update(issues)
+      .set({ monitorNextCheckAt: new Date(Date.now() + 60 * 60 * 1000) })
+      .where(eq(issues.id, issueId));
+
+    const result = await heartbeatService(db).reconcileStrandedAssignedIssues();
+
+    // A terminal-failed latest run is never suppressed by a monitor park; recovery
+    // proceeds so the failure stays visible.
+    expect(result.monitorParkSuppressed).toBe(0);
+    expect(result.continuationRequeued + result.escalated).toBeGreaterThan(0);
+  });
+
   it("assigns open unassigned blockers back to their creator agent", async () => {
     const companyId = randomUUID();
     const creatorAgentId = randomUUID();

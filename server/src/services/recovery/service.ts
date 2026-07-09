@@ -43,6 +43,7 @@ import {
   type IssueLivenessFinding,
 } from "./issue-graph-liveness.js";
 import { isAutomaticRecoverySuppressedByPauseHold } from "./pause-hold-guard.js";
+import { isMonitorParkActive } from "./monitor-park.js";
 
 const EXECUTION_PATH_HEARTBEAT_RUN_STATUSES = ["queued", "running", "scheduled_retry"] as const;
 const UNSUCCESSFUL_HEARTBEAT_RUN_TERMINAL_STATUSES = ["failed", "cancelled", "timed_out"] as const;
@@ -1581,12 +1582,15 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         ),
       );
 
+    const honorMonitorPark = (await instanceSettings.getExperimental()).honorMonitorParkForRecovery;
+
     const result = {
       assignmentDispatched: 0,
       dispatchRequeued: 0,
       continuationRequeued: 0,
       productiveContinuationObserved: 0,
       successfulContinuationObserved: 0,
+      monitorParkSuppressed: 0,
       orphanBlockersAssigned: 0,
       escalated: 0,
       skipped: 0,
@@ -1617,6 +1621,39 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       }
 
       const latestRun = await getLatestIssueRun(issue.companyId, issue.id);
+
+      // ALAA-1882: honor a future monitorNextCheckAt as a valid parked disposition and
+      // skip missing-disposition recovery until it fires — but ONLY when the latest run
+      // is not a genuine terminal failure, so budget/adapter failures are never masked
+      // and still escalate. Self-expiring once the monitor instant passes.
+      if (
+        honorMonitorPark &&
+        isMonitorParkActive(issue.monitorNextCheckAt) &&
+        !isUnsuccessfulTerminalIssueRun(latestRun)
+      ) {
+        await logActivity(db, {
+          companyId: issue.companyId,
+          actorType: "system",
+          actorId: "system",
+          agentId: null,
+          runId: null,
+          action: "recovery.monitor_park_suppressed",
+          entityType: "issue",
+          entityId: issue.id,
+          details: {
+            identifier: issue.identifier,
+            source: "recovery.reconcile_stranded_assigned_issue",
+            status: issue.status,
+            latestRunId: latestRun?.id ?? null,
+            latestRunStatus: latestRun?.status ?? null,
+            monitorNextCheckAt: issue.monitorNextCheckAt?.toISOString() ?? null,
+          },
+        });
+        result.monitorParkSuppressed += 1;
+        result.skipped += 1;
+        continue;
+      }
+
       if (isStrandedIssueRecoveryIssue(issue) && isUnsuccessfulTerminalIssueRun(latestRun)) {
         const updated = await escalateStrandedRecoveryIssueInPlace({
           issue,
@@ -1790,6 +1827,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
           createdByAgentId: issues.createdByAgentId,
           createdByUserId: issues.createdByUserId,
           executionState: issues.executionState,
+          monitorNextCheckAt: issues.monitorNextCheckAt,
         })
         .from(issues)
         .where(
@@ -1895,6 +1933,17 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       }];
     });
 
+    // ALAA-1882: pre-filter to the bounded set of monitor-parked issues (future +
+    // within horizon) so the pure classifier honors them as a valid waiting path.
+    // Dropped entirely when the gate is off, restoring exact prior behavior.
+    const honorMonitorPark = (await instanceSettings.getExperimental()).honorMonitorParkForRecovery;
+    const monitorParkedPaths = honorMonitorPark
+      ? issueRows.flatMap((row) =>
+        isMonitorParkActive(row.monitorNextCheckAt)
+          ? [{ companyId: row.companyId, issueId: row.id, status: row.status }]
+          : [])
+      : [];
+
     return classifyIssueGraphLiveness({
       issues: issueRows,
       relations: relationRows,
@@ -1919,6 +1968,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       pendingInteractions: interactionRows,
       pendingApprovals: approvalRows,
       openRecoveryIssues,
+      monitorParkedPaths,
     });
   }
 

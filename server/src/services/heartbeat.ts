@@ -110,6 +110,7 @@ import {
 } from "./execution-workspace-policy.js";
 import { instanceSettingsService } from "./instance-settings.js";
 import {
+  MONITOR_PARK_SKIP_REASON,
   RECOVERY_ORIGIN_KINDS,
   RUN_LIVENESS_CONTINUATION_REASON,
   buildRunLivenessContinuationIdempotencyKey,
@@ -3015,6 +3016,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           assigneeAgentId: issues.assigneeAgentId,
           executionState: issues.executionState,
           projectId: issues.projectId,
+          monitorNextCheckAt: issues.monitorNextCheckAt,
         })
         .from(issues)
         .where(and(eq(issues.id, issueId), eq(issues.companyId, run.companyId)))
@@ -3077,6 +3079,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       })
       : null;
 
+    const honorMonitorPark = (await instanceSettings.getExperimental()).honorMonitorParkForRecovery;
     const decision = decideRunLivenessContinuation({
       run,
       issue,
@@ -3086,7 +3089,30 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       nextAction: run.nextAction,
       budgetBlocked: Boolean(budgetBlock),
       idempotentWakeExists: Boolean(existingWake),
+      honorMonitorPark,
     });
+
+    // ALAA-1882: record each monitor-park suppression so ALAA-1682 can count the
+    // no-op heartbeats it prevented.
+    if (decision.kind === "skip" && decision.reason === MONITOR_PARK_SKIP_REASON && issue) {
+      await logActivity(db, {
+        companyId: issue.companyId,
+        actorType: "system",
+        actorId: "heartbeat",
+        agentId: run.agentId,
+        runId: run.id,
+        action: "recovery.monitor_park_suppressed",
+        entityType: "issue",
+        entityId: issue.id,
+        details: {
+          identifier: issue.identifier,
+          source: "recovery.run_liveness_continuation",
+          livenessState,
+          monitorNextCheckAt: issue.monitorNextCheckAt?.toISOString() ?? null,
+        },
+      });
+      return;
+    }
 
     if (decision.kind === "exhausted") {
       await setRunStatus(run.id, run.status, {

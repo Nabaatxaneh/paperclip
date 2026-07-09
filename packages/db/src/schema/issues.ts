@@ -58,6 +58,11 @@ export const issues = pgTable(
     completedAt: timestamp("completed_at", { withTimezone: true }),
     cancelledAt: timestamp("cancelled_at", { withTimezone: true }),
     hiddenAt: timestamp("hidden_at", { withTimezone: true }),
+    // ALAA-1882: when an agent parks a time-/event-gated issue (ALAA-1681 §A1/§A2),
+    // it records the event time here. A future value is honored by the recovery
+    // guards as a valid "next-step disposition" and suppresses missing-disposition
+    // recovery churn until it passes. Nullable; null/past = no suppression.
+    monitorNextCheckAt: timestamp("monitor_next_check_at", { withTimezone: true }),
     createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
     updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
   },

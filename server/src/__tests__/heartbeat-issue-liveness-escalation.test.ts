@@ -283,6 +283,53 @@ describeEmbeddedPostgres("heartbeat issue graph liveness escalation", () => {
     expect(result.escalationsCreated).toBe(0);
   });
 
+  it("honors a future monitorNextCheckAt on the leaf blocker as a valid parked disposition (ALAA-1882)", async () => {
+    await enableAutoRecovery();
+    const { companyId, blockerIssueId } = await seedBlockedChain();
+    await db
+      .update(issues)
+      .set({ monitorNextCheckAt: new Date(Date.now() + 60 * 60 * 1000) })
+      .where(eq(issues.id, blockerIssueId));
+
+    const result = await heartbeatService(db).reconcileIssueGraphLiveness();
+
+    expect(result.findings).toBe(0);
+    expect(result.escalationsCreated).toBe(0);
+
+    const escalations = await db
+      .select()
+      .from(issues)
+      .where(and(eq(issues.companyId, companyId), eq(issues.originKind, "harness_liveness_escalation")));
+    expect(escalations).toHaveLength(0);
+  });
+
+  it("resumes liveness recovery when the honorMonitorParkForRecovery gate is off (ALAA-1882)", async () => {
+    await enableAutoRecovery();
+    await instanceSettingsService(db).updateExperimental({ honorMonitorParkForRecovery: false });
+    const { blockerIssueId } = await seedBlockedChain();
+    await db
+      .update(issues)
+      .set({ monitorNextCheckAt: new Date(Date.now() + 60 * 60 * 1000) })
+      .where(eq(issues.id, blockerIssueId));
+
+    const result = await heartbeatService(db).reconcileIssueGraphLiveness();
+
+    expect(result.findings).toBe(1);
+  });
+
+  it("resumes liveness recovery once the monitor park is in the past (ALAA-1882 event-overdue)", async () => {
+    await enableAutoRecovery();
+    const { blockerIssueId } = await seedBlockedChain();
+    await db
+      .update(issues)
+      .set({ monitorNextCheckAt: new Date(Date.now() - 60 * 1000) })
+      .where(eq(issues.id, blockerIssueId));
+
+    const result = await heartbeatService(db).reconcileIssueGraphLiveness();
+
+    expect(result.findings).toBe(1);
+  });
+
   it("creates one manager escalation, preserves blockers, and records owner selection", async () => {
     await enableAutoRecovery();
     const { companyId, managerId, blockedIssueId, blockerIssueId } = await seedBlockedChain();

@@ -1436,6 +1436,7 @@ const issueListSelect = {
   completedAt: issues.completedAt,
   cancelledAt: issues.cancelledAt,
   hiddenAt: issues.hiddenAt,
+  monitorNextCheckAt: issues.monitorNextCheckAt,
   createdAt: issues.createdAt,
   updatedAt: issues.updatedAt,
 };
