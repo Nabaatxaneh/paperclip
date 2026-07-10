@@ -5,6 +5,7 @@ import {
   buildRunLivenessContinuationIdempotencyKey,
   decideRunLivenessContinuation,
 } from "../services/run-continuations.ts";
+import { MONITOR_PARK_SKIP_REASON } from "../services/recovery/index.ts";
 
 const companyId = "company-1";
 const agentId = "agent-1";
@@ -149,5 +150,118 @@ describe("run liveness continuations", () => {
 
       expect(decision.kind).toBe("skip");
     }
+  });
+});
+
+describe("run liveness continuations — monitor park (ALAA-1882)", () => {
+  const now = new Date("2026-07-09T12:00:00Z");
+  const futureMonitor = new Date("2026-07-09T13:35:00Z"); // in-window
+  const pastMonitor = new Date("2026-07-09T11:00:00Z");
+  const farMonitor = new Date("2026-07-20T12:00:01Z"); // > 7 day horizon
+
+  it("skips a succeeded empty_response run on an issue parked to a future monitor", () => {
+    const decision = decideRunLivenessContinuation({
+      run: run(),
+      issue: issue({ monitorNextCheckAt: futureMonitor }),
+      agent: agent(),
+      livenessState: "empty_response",
+      livenessReason: "Silent no-op end while parked",
+      nextAction: null,
+      budgetBlocked: false,
+      idempotentWakeExists: false,
+      honorMonitorPark: true,
+      now,
+    });
+
+    expect(decision.kind).toBe("skip");
+    if (decision.kind !== "skip") return;
+    expect(decision.reason).toBe(MONITOR_PARK_SKIP_REASON);
+  });
+
+  it("monitor park takes precedence over continuation exhaustion", () => {
+    const decision = decideRunLivenessContinuation({
+      run: run({ continuationAttempt: DEFAULT_MAX_LIVENESS_CONTINUATION_ATTEMPTS }),
+      issue: issue({ monitorNextCheckAt: futureMonitor }),
+      agent: agent(),
+      livenessState: "plan_only",
+      livenessReason: "Still planning while parked",
+      nextAction: null,
+      budgetBlocked: false,
+      idempotentWakeExists: false,
+      honorMonitorPark: true,
+      now,
+    });
+
+    expect(decision.kind).toBe("skip");
+    if (decision.kind !== "skip") return;
+    expect(decision.reason).toBe(MONITOR_PARK_SKIP_REASON);
+  });
+
+  it("does not suppress when the honorMonitorPark gate is off", () => {
+    const decision = decideRunLivenessContinuation({
+      run: run(),
+      issue: issue({ monitorNextCheckAt: futureMonitor }),
+      agent: agent(),
+      livenessState: "empty_response",
+      livenessReason: "No useful output",
+      nextAction: null,
+      budgetBlocked: false,
+      idempotentWakeExists: false,
+      honorMonitorPark: false,
+      now,
+    });
+
+    expect(decision.kind).toBe("enqueue");
+  });
+
+  it("does not suppress when the monitor is already in the past (event-overdue resumes)", () => {
+    const decision = decideRunLivenessContinuation({
+      run: run(),
+      issue: issue({ monitorNextCheckAt: pastMonitor }),
+      agent: agent(),
+      livenessState: "empty_response",
+      livenessReason: "No useful output",
+      nextAction: null,
+      budgetBlocked: false,
+      idempotentWakeExists: false,
+      honorMonitorPark: true,
+      now,
+    });
+
+    expect(decision.kind).toBe("enqueue");
+  });
+
+  it("does not suppress when the monitor is beyond the 7-day horizon cap", () => {
+    const decision = decideRunLivenessContinuation({
+      run: run(),
+      issue: issue({ monitorNextCheckAt: farMonitor }),
+      agent: agent(),
+      livenessState: "empty_response",
+      livenessReason: "No useful output",
+      nextAction: null,
+      budgetBlocked: false,
+      idempotentWakeExists: false,
+      honorMonitorPark: true,
+      now,
+    });
+
+    expect(decision.kind).toBe("enqueue");
+  });
+
+  it("does not suppress when monitorNextCheckAt is null", () => {
+    const decision = decideRunLivenessContinuation({
+      run: run(),
+      issue: issue({ monitorNextCheckAt: null }),
+      agent: agent(),
+      livenessState: "empty_response",
+      livenessReason: "No useful output",
+      nextAction: null,
+      budgetBlocked: false,
+      idempotentWakeExists: false,
+      honorMonitorPark: true,
+      now,
+    });
+
+    expect(decision.kind).toBe("enqueue");
   });
 });

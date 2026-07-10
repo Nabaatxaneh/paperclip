@@ -3,9 +3,13 @@ import type { Db } from "@paperclipai/db";
 import { agentWakeupRequests, agents, heartbeatRuns, issues } from "@paperclipai/db";
 import type { RunLivenessState } from "@paperclipai/shared";
 import { RECOVERY_REASON_KINDS } from "./origins.js";
+import { isMonitorParkActive } from "./monitor-park.js";
 
 export const RUN_LIVENESS_CONTINUATION_REASON = RECOVERY_REASON_KINDS.runLivenessContinuation;
 export const DEFAULT_MAX_LIVENESS_CONTINUATION_ATTEMPTS = 2;
+// ALAA-1882: distinct skip reason the caller detects to emit the
+// `recovery.monitor_park_suppressed` activity event.
+export const MONITOR_PARK_SKIP_REASON = "issue parked to future monitor";
 
 const ACTIONABLE_LIVENESS_STATES = new Set<RunLivenessState>(["plan_only", "empty_response"]);
 const CONTINUATION_ACTIVE_ISSUE_STATUSES = new Set(["todo", "in_progress"]);
@@ -17,7 +21,15 @@ const IDEMPOTENT_WAKE_STATUSES = ["queued", "deferred_issue_execution", "complet
 type HeartbeatRunRow = typeof heartbeatRuns.$inferSelect;
 type IssueRow = Pick<
   typeof issues.$inferSelect,
-  "id" | "companyId" | "identifier" | "title" | "status" | "assigneeAgentId" | "executionState" | "projectId"
+  | "id"
+  | "companyId"
+  | "identifier"
+  | "title"
+  | "status"
+  | "assigneeAgentId"
+  | "executionState"
+  | "projectId"
+  | "monitorNextCheckAt"
 >;
 type AgentRow = Pick<typeof agents.$inferSelect, "id" | "companyId" | "status">;
 
@@ -91,6 +103,8 @@ export function decideRunLivenessContinuation(input: {
   budgetBlocked: boolean;
   idempotentWakeExists: boolean;
   maxAttempts?: number;
+  honorMonitorPark?: boolean;
+  now?: Date;
 }): RunContinuationDecision {
   const {
     run,
@@ -101,6 +115,8 @@ export function decideRunLivenessContinuation(input: {
     nextAction,
     budgetBlocked,
     idempotentWakeExists,
+    honorMonitorPark,
+    now,
   } = input;
   const maxAttempts = input.maxAttempts ?? DEFAULT_MAX_LIVENESS_CONTINUATION_ATTEMPTS;
 
@@ -120,6 +136,13 @@ export function decideRunLivenessContinuation(input: {
   }
   if (issue.executionState) {
     return { kind: "skip", reason: "issue is blocked by execution policy state" };
+  }
+  // ALAA-1882: a future monitorNextCheckAt is a valid parked "next-step disposition"
+  // (an owner deliberately parked this time-/event-gated issue). Suppress the bounded
+  // liveness continuation re-wake until the monitor fires. Self-expiring: once the
+  // instant passes, isMonitorParkActive returns false and normal behavior resumes.
+  if (honorMonitorPark && isMonitorParkActive(issue.monitorNextCheckAt, now)) {
+    return { kind: "skip", reason: MONITOR_PARK_SKIP_REASON };
   }
   if (!CONTINUATION_AGENT_STATUSES.has(agent.status)) {
     return { kind: "skip", reason: `agent status ${agent.status} is not invokable` };

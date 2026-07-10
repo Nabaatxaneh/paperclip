@@ -4,6 +4,7 @@ import {
   DEFAULT_FEEDBACK_DATA_SHARING_PREFERENCE,
   DEFAULT_BACKUP_RETENTION,
   DEFAULT_ISSUE_GRAPH_LIVENESS_AUTO_RECOVERY_LOOKBACK_HOURS,
+  DEFAULT_HONOR_MONITOR_PARK_FOR_RECOVERY,
   instanceGeneralSettingsSchema,
   type InstanceGeneralSettings,
   instanceExperimentalSettingsSchema,
@@ -46,6 +47,8 @@ function normalizeExperimentalSettings(raw: unknown): InstanceExperimentalSettin
       issueGraphLivenessAutoRecoveryLookbackHours:
         parsed.data.issueGraphLivenessAutoRecoveryLookbackHours ??
         DEFAULT_ISSUE_GRAPH_LIVENESS_AUTO_RECOVERY_LOOKBACK_HOURS,
+      honorMonitorParkForRecovery:
+        parsed.data.honorMonitorParkForRecovery ?? DEFAULT_HONOR_MONITOR_PARK_FOR_RECOVERY,
     };
   }
   return {
@@ -55,6 +58,7 @@ function normalizeExperimentalSettings(raw: unknown): InstanceExperimentalSettin
     enableIssueGraphLivenessAutoRecovery: false,
     issueGraphLivenessAutoRecoveryLookbackHours:
       DEFAULT_ISSUE_GRAPH_LIVENESS_AUTO_RECOVERY_LOOKBACK_HOURS,
+    honorMonitorParkForRecovery: DEFAULT_HONOR_MONITOR_PARK_FOR_RECOVERY,
   };
 }
 

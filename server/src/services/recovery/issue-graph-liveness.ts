@@ -99,6 +99,11 @@ export interface IssueGraphLivenessInput {
   pendingInteractions?: IssueLivenessWaitingPathInput[];
   pendingApprovals?: IssueLivenessWaitingPathInput[];
   openRecoveryIssues?: IssueLivenessWaitingPathInput[];
+  // ALAA-1882: issues whose monitorNextCheckAt is a bounded future instant. Such a
+  // monitor park is a valid parked disposition and suppresses liveness findings until
+  // it fires. The caller pre-filters to the in-window set (and drops it entirely when
+  // the honorMonitorParkForRecovery gate is off), so the classifier stays pure/time-free.
+  monitorParkedPaths?: IssueLivenessWaitingPathInput[];
 }
 
 const INVOKABLE_AGENT_STATUSES = new Set(["active", "idle", "running", "error"]);
@@ -318,6 +323,7 @@ export function classifyIssueGraphLiveness(input: IssueGraphLivenessInput): Issu
   const pendingInteractions = input.pendingInteractions ?? [];
   const pendingApprovals = input.pendingApprovals ?? [];
   const openRecoveryIssues = input.openRecoveryIssues ?? [];
+  const monitorParkedPaths = input.monitorParkedPaths ?? [];
 
   for (const relation of input.relations) {
     const list = blockersByBlockedIssueId.get(relation.blockedIssueId) ?? [];
@@ -354,7 +360,8 @@ export function classifyIssueGraphLiveness(input: IssueGraphLivenessInput): Issu
       hasActiveExecutionPath(issue.companyId, issue.id, activeRuns, queuedWakeRequests) ||
       hasWaitingPath(issue.companyId, issue.id, pendingInteractions) ||
       hasWaitingPath(issue.companyId, issue.id, pendingApprovals) ||
-      hasWaitingPath(issue.companyId, issue.id, openRecoveryIssues);
+      hasWaitingPath(issue.companyId, issue.id, openRecoveryIssues) ||
+      hasWaitingPath(issue.companyId, issue.id, monitorParkedPaths);
   }
 
   function reviewFinding(

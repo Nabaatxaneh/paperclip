@@ -152,3 +152,57 @@ describe("recovery classifier boundary", () => {
     expect(isStrandedIssueRecoveryOriginKind(null)).toBe(false);
   });
 });
+
+describe("issue graph liveness — monitor park (ALAA-1882)", () => {
+  function blockedByUnassignedLeafInput(
+    monitorParkedPaths?: Array<{ companyId: string; issueId: string; status: string }>,
+  ) {
+    return {
+      issues: [
+        {
+          id: issueId,
+          companyId,
+          identifier: "PAP-3001",
+          title: "Parked source",
+          status: "blocked",
+          assigneeAgentId: agentId,
+          assigneeUserId: null,
+          createdByAgentId: null,
+          createdByUserId: null,
+          executionState: null,
+        },
+        {
+          id: blockerId,
+          companyId,
+          identifier: "PAP-3002",
+          title: "Time-gated leaf parked to an armed task",
+          status: "todo",
+          assigneeAgentId: null,
+          assigneeUserId: null,
+          createdByAgentId: null,
+          createdByUserId: null,
+          executionState: null,
+        },
+      ],
+      relations: [{ companyId, blockerIssueId: blockerId, blockedIssueId: issueId }],
+      agents: [
+        { id: agentId, companyId, name: "Coder", role: "engineer", status: "idle", reportsTo: managerId },
+        { id: managerId, companyId, name: "CTO", role: "cto", status: "idle", reportsTo: null },
+      ],
+      ...(monitorParkedPaths ? { monitorParkedPaths } : {}),
+    };
+  }
+
+  it("produces a blocked finding when the leaf blocker is not monitor-parked", () => {
+    const findings = classifyIssueGraphLiveness(blockedByUnassignedLeafInput());
+    expect(findings).toHaveLength(1);
+    expect(findings[0]?.state).toBe("blocked_by_unassigned_issue");
+  });
+
+  it("suppresses the finding when the only waiting path is a future monitor park", () => {
+    const findings = classifyIssueGraphLiveness(
+      blockedByUnassignedLeafInput([{ companyId, issueId: blockerId, status: "todo" }]),
+    );
+    expect(findings).toHaveLength(0);
+  });
+});

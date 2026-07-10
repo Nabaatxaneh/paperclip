@@ -95,6 +95,24 @@ describe("issue validators", () => {
     expect(parsed.requestDepth).toBe(MAX_ISSUE_REQUEST_DEPTH);
   });
 
+  it("accepts a monitorNextCheckAt ISO instant and null on update (ALAA-1888)", () => {
+    const parked = updateIssueSchema.parse({
+      monitorNextCheckAt: "2026-07-09T18:00:00.000Z",
+    });
+    expect(parked.monitorNextCheckAt).toBe("2026-07-09T18:00:00.000Z");
+
+    const cleared = updateIssueSchema.parse({ monitorNextCheckAt: null });
+    expect(cleared.monitorNextCheckAt).toBeNull();
+
+    const omitted = updateIssueSchema.parse({ comment: "no monitor change" });
+    expect(omitted.monitorNextCheckAt).toBeUndefined();
+  });
+
+  it("rejects a non-datetime monitorNextCheckAt (ALAA-1888)", () => {
+    const parsed = updateIssueSchema.safeParse({ monitorNextCheckAt: "not-a-date" });
+    expect(parsed.success).toBe(false);
+  });
+
   it("accepts the cheap model profile in issue assignee adapter overrides", () => {
     const parsed = createIssueSchema.parse({
       title: "Run a cheap heartbeat",

@@ -24,6 +24,7 @@ import {
 } from "./helpers/embedded-postgres.js";
 import { instanceSettingsService } from "../services/instance-settings.ts";
 import { clampIssueListLimit, ISSUE_LIST_MAX_LIMIT, issueService } from "../services/issues.ts";
+import { isMonitorParkActive } from "../services/recovery/monitor-park.ts";
 import { buildProjectMentionHref, MAX_ISSUE_REQUEST_DEPTH } from "@paperclipai/shared";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
@@ -493,6 +494,42 @@ describeEmbeddedPostgres("issueService.list participantAgentId", () => {
 
   it("returns null instead of throwing for malformed non-uuid issue refs", async () => {
     await expect(svc.getById("not-a-uuid")).resolves.toBeNull();
+  });
+
+  it("persists and clears monitorNextCheckAt via update (ALAA-1888)", async () => {
+    const companyId = randomUUID();
+    const issueId = randomUUID();
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Time-gated paper open",
+      status: "todo",
+      priority: "high",
+    });
+
+    // Agent parks the issue to a future instant (route hands the service a Date).
+    const parkAt = new Date("2026-07-09T18:00:00.000Z");
+    await svc.update(issueId, { monitorNextCheckAt: parkAt });
+
+    const parked = await svc.getById(issueId);
+    expect(parked?.monitorNextCheckAt).toBeInstanceOf(Date);
+    expect(parked?.monitorNextCheckAt?.toISOString()).toBe("2026-07-09T18:00:00.000Z");
+    // Guard honors the future park -> churn suppressed (see monitor-park.test.ts).
+    expect(isMonitorParkActive(parked?.monitorNextCheckAt, new Date("2026-07-09T13:35:00.000Z"))).toBe(true);
+    // Once past the instant the park self-expires -> recovery resumes.
+    expect(isMonitorParkActive(parked?.monitorNextCheckAt, new Date("2026-07-09T18:00:01.000Z"))).toBe(false);
+
+    // Clearing to null removes the park (e.g. ALAA-1677 R2 clear-on-billing-limit).
+    await svc.update(issueId, { monitorNextCheckAt: null });
+    const cleared = await svc.getById(issueId);
+    expect(cleared?.monitorNextCheckAt).toBeNull();
   });
   it("filters issues by execution workspace id", async () => {
     const companyId = randomUUID();
