@@ -3605,6 +3605,11 @@ export function issueService(db: Db) {
       body: string,
       actor: { agentId?: string; userId?: string; runId?: string | null },
     ) => {
+      // ALAA-1907: defense-in-depth — never persist a whitespace-only comment,
+      // even for internal callers that bypass addIssueCommentSchema.
+      if (typeof body === "string" && body.trim() === "") {
+        throw unprocessable("Comment body cannot be empty");
+      }
       const issue = await db
         .select({ companyId: issues.companyId })
         .from(issues)
