@@ -179,7 +179,7 @@ export type CreateIssueLabel = z.infer<typeof createIssueLabelSchema>;
 export const updateIssueSchema = createIssueSchema.partial().extend({
   requestDepth: issueRequestDepthInputSchema.optional(),
   assigneeAgentId: z.string().trim().min(1).optional().nullable(),
-  comment: multilineTextSchema.pipe(z.string().min(1)).optional(),
+  comment: multilineTextSchema.pipe(z.string().trim().min(1)).optional(),
   reviewRequest: issueReviewRequestSchema.optional().nullable(),
   reopen: z.boolean().optional(),
   resume: z.boolean().optional(),
@@ -198,7 +198,7 @@ export const checkoutIssueSchema = z.object({
 export type CheckoutIssue = z.infer<typeof checkoutIssueSchema>;
 
 export const addIssueCommentSchema = z.object({
-  body: multilineTextSchema.pipe(z.string().min(1)),
+  body: multilineTextSchema.pipe(z.string().trim().min(1)),
   reopen: z.boolean().optional(),
   resume: z.boolean().optional(),
   interrupt: z.boolean().optional(),

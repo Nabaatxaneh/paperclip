@@ -599,6 +599,21 @@ export function issueThreadInteractionService(db: Db) {
       throw conflict("Interaction has already been resolved");
     }
     await touchIssue(db, args.issue.id);
+    // ALAA-1907: surface the decline reason as a first-class issue comment so it
+    // reaches the assignee's wake context (the result JSONB alone never does).
+    if (reason) {
+      try {
+        await db.insert(issueComments).values({
+          companyId: args.issue.companyId,
+          issueId: args.issue.id,
+          authorAgentId: args.actor.agentId ?? null,
+          authorUserId: args.actor.userId ?? null,
+          body: `**Board resolution — confirmation declined** (interaction ${args.current.id.slice(0, 8)}):\n\n${reason}`,
+        });
+      } catch (e) {
+        console.error("ALAA-1907 rrc reason-comment insert failed", e);
+      }
+    }
     return hydrateInteraction(updated);
   }
 
@@ -961,6 +976,21 @@ export function issueThreadInteractionService(db: Db) {
       }
 
       await touchIssue(db, issue.id);
+      // ALAA-1907: surface the decline reason as a first-class issue comment.
+      const rstReason = input.reason?.trim();
+      if (rstReason) {
+        try {
+          await db.insert(issueComments).values({
+            companyId: issue.companyId,
+            issueId: issue.id,
+            authorAgentId: actor.agentId ?? null,
+            authorUserId: actor.userId ?? null,
+            body: `**Board resolution — suggested tasks declined** (interaction ${interactionId.slice(0, 8)}):\n\n${rstReason}`,
+          });
+        } catch (e) {
+          console.error("ALAA-1907 rst reason-comment insert failed", e);
+        }
+      }
       return hydrateInteraction(updated);
     },
 
@@ -1203,6 +1233,20 @@ export function issueThreadInteractionService(db: Db) {
       }
 
       await touchIssue(db, issue.id);
+      // ALAA-1907: surface the cancellation reason as a first-class issue comment.
+      if (reason) {
+        try {
+          await db.insert(issueComments).values({
+            companyId: issue.companyId,
+            issueId: issue.id,
+            authorAgentId: actor.agentId ?? null,
+            authorUserId: actor.userId ?? null,
+            body: `**Board resolution — questions cancelled** (interaction ${interactionId.slice(0, 8)}):\n\n${reason}`,
+          });
+        } catch (e) {
+          console.error("ALAA-1907 cq reason-comment insert failed", e);
+        }
+      }
       return hydrateInteraction(updated);
     },
   };
