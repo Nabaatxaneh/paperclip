@@ -78,5 +78,19 @@ export const heartbeatRuns = pgTable(
       table.status,
       table.processStartedAt,
     ),
+    // ALAA-1959: the dashboard polls list() (WHERE company_id ORDER BY created_at DESC)
+    // every ~1-2s. Without this index every poll seq-scanned ~21k rows and detoasted
+    // context_snapshot (~2.4-5s/poll, pileup). Live-hotfixed as alamut_hb_runs_company_created_desc_idx;
+    // this is its durable equivalent. Drop the alamut_* shadow once this migration lands in prod.
+    companyCreatedIdx: index("heartbeat_runs_company_created_idx").on(
+      table.companyId,
+      table.createdAt.desc(),
+    ),
+    // ALAA-1959: serves the started_at DESC company-scoped active-run paths.
+    // Live-hotfixed as alamut_hb_runs_company_started_desc_idx.
+    companyStartedIdx: index("heartbeat_runs_company_started_idx").on(
+      table.companyId,
+      table.startedAt.desc(),
+    ),
   }),
 );
