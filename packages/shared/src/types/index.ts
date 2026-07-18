@@ -83,6 +83,11 @@ export type {
   SmokeRunTrigger,
 } from "./smoke-lab.js";
 export {
+  ISSUE_EXTERNAL_BLOCKER_KINDS,
+  ISSUE_EXTERNAL_BLOCKER_UNDATED_TTL_MS,
+  isIssueExternalBlockerActive,
+} from "./issue.js";
+export {
   SMOKE_RUN_STATUSES,
   SMOKE_RUN_STEP_PATHS,
   SMOKE_RUN_STEP_STATUSES,
@@ -558,6 +563,8 @@ export type {
   IssueBlockerAttention,
   IssueBlockerAttentionReason,
   IssueBlockerAttentionState,
+  IssueExternalBlocker,
+  IssueExternalBlockerKind,
   IssueInboxAttentionKind,
   IssueBlockedInboxAction,
   IssueBlockedInboxAttention,

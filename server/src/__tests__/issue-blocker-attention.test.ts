@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { eq } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
+import type { IssueExternalBlocker } from "@paperclipai/shared";
 import {
   activityLog,
   agents,
@@ -101,6 +102,7 @@ describeEmbeddedPostgres("issue blocker attention", () => {
     originFingerprint?: string | null;
     executionState?: Record<string, unknown> | null;
     description?: string | null;
+    externalBlocker?: IssueExternalBlocker | null;
   }) {
     const id = input.id ?? randomUUID();
     await db.insert(issues).values({
@@ -118,6 +120,7 @@ describeEmbeddedPostgres("issue blocker attention", () => {
       originFingerprint: input.originFingerprint ?? "default",
       executionState: input.executionState ?? null,
       description: input.description ?? null,
+      externalBlocker: input.externalBlocker ?? null,
     });
     return id;
   }
@@ -908,6 +911,119 @@ describeEmbeddedPostgres("issue blocker attention", () => {
     expect(rows.map((row) => row.id)).toEqual([assignedParentId]);
 
     await expect(svc.count(companyId, { attention: "blocked", assigneeAgentId: agentId })).resolves.toBe(1);
+  });
+
+  // ALAA-2078: ALAA-1681 A1 parks a blocked issue on a non-issue external actor.
+  // Blocker edges are issue->issue only, so without externalBlocker these are
+  // indistinguishable from abandoned work.
+  it("keeps a zero-edge blocked issue with no external blocker at needs_attention", async () => {
+    const { companyId, agentId } = await createCompany("XB1");
+    const issueId = await insertIssue({
+      companyId,
+      identifier: "XB1-1",
+      title: "Blocked on nothing nameable",
+      status: "blocked",
+      assigneeAgentId: agentId,
+    });
+
+    const map = await svc.listBlockerAttention(companyId, [
+      { id: issueId, companyId, parentId: null, identifier: "XB1-1", title: "t", status: "blocked", assigneeAgentId: agentId, assigneeUserId: null, externalBlocker: null },
+    ]);
+    expect(map.get(issueId)).toMatchObject({
+      state: "needs_attention",
+      reason: "attention_required",
+    });
+  });
+
+  it("parks a zero-edge blocked issue whose external blocker has a future eventAt", async () => {
+    const { companyId, agentId } = await createCompany("XB2");
+    const externalBlocker: IssueExternalBlocker = {
+      kind: "scheduled_task",
+      ref: "ALAA2067-ColocationProbe",
+      eventAt: new Date(Date.now() + 60 * 60 * 1000).toISOString(),
+      setAt: new Date().toISOString(),
+    };
+    const issueId = await insertIssue({
+      companyId,
+      identifier: "XB2-1",
+      title: "Parked on an armed task",
+      status: "blocked",
+      assigneeAgentId: agentId,
+      externalBlocker,
+    });
+
+    const map = await svc.listBlockerAttention(companyId, [
+      { id: issueId, companyId, parentId: null, identifier: "XB2-1", title: "t", status: "blocked", assigneeAgentId: agentId, assigneeUserId: null, externalBlocker },
+    ]);
+    expect(map.get(issueId)).toMatchObject({
+      state: "parked_external",
+      reason: "external_actor",
+      sampleBlockerIdentifier: "ALAA2067-ColocationProbe",
+    });
+  });
+
+  it("escalates a parked issue back to needs_attention once eventAt has passed", async () => {
+    const { companyId, agentId } = await createCompany("XB3");
+    const externalBlocker: IssueExternalBlocker = {
+      kind: "scheduled_task",
+      ref: "ALAA2067-ColocationProbe",
+      eventAt: new Date(Date.now() - 60 * 60 * 1000).toISOString(),
+      setAt: new Date(Date.now() - 2 * 60 * 60 * 1000).toISOString(),
+    };
+    const issueId = await insertIssue({
+      companyId,
+      identifier: "XB3-1",
+      title: "Armed task should have fired by now",
+      status: "blocked",
+      assigneeAgentId: agentId,
+      externalBlocker,
+    });
+
+    const map = await svc.listBlockerAttention(companyId, [
+      { id: issueId, companyId, parentId: null, identifier: "XB3-1", title: "t", status: "blocked", assigneeAgentId: agentId, assigneeUserId: null, externalBlocker },
+    ]);
+    expect(map.get(issueId)).toMatchObject({
+      state: "needs_attention",
+      reason: "attention_required",
+    });
+  });
+
+  it("stamps setAt server-side and does not renew it when the same blocker is re-asserted", async () => {
+    const { companyId, agentId } = await createCompany("XB4");
+    const issueId = await insertIssue({
+      companyId,
+      identifier: "XB4-1",
+      title: "Park then re-assert",
+      status: "blocked",
+      assigneeAgentId: agentId,
+    });
+
+    await svc.update(issueId, {
+      externalBlocker: { kind: "human", ref: "COO", eventAt: null } as any,
+    });
+    const first = await svc.getById(issueId);
+    const firstSetAt = first?.externalBlocker?.setAt;
+    expect(firstSetAt).toBeTruthy();
+
+    await svc.update(issueId, {
+      externalBlocker: { kind: "human", ref: "COO", eventAt: null } as any,
+    });
+    const second = await svc.getById(issueId);
+    expect(second?.externalBlocker?.setAt).toBe(firstSetAt);
+  });
+
+  it("merges blockedByIssueIds on the update path", async () => {
+    const { companyId, agentId } = await createCompany("XB5");
+    const parentId = await insertIssue({
+      companyId, identifier: "XB5-1", title: "parent", status: "blocked", assigneeAgentId: agentId,
+    });
+    const blockerId = await insertIssue({
+      companyId, identifier: "XB5-2", title: "blocker", status: "todo", assigneeAgentId: agentId,
+    });
+
+    await svc.update(parentId, { blockedByIssueIds: [blockerId] });
+    const relations = await svc.getRelationSummaries(parentId);
+    expect(relations.blockedBy?.map((relation) => relation.id)).toContain(blockerId);
   });
 
   it("rejects malformed assigneeAgentId filter values on the blocked-inbox path", async () => {

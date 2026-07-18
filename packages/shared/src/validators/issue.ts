@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { ISSUE_EXTERNAL_BLOCKER_KINDS } from "../types/issue.js";
 import {
   ISSUE_EXECUTION_DECISION_OUTCOMES,
   ISSUE_EXECUTION_MONITOR_CLEAR_REASONS,
@@ -419,6 +420,18 @@ function withCreateIssueStatusDefault<T extends z.ZodRawShape>(schema: z.ZodObje
   }, schema);
 }
 
+/**
+ * ALAA-2078 AC1. `setAt` is deliberately absent: it is stamped server-side so a
+ * caller cannot refresh it to keep an issue parked past the AC3 staleness check.
+ */
+export const issueExternalBlockerSchema = z.object({
+  kind: z.enum(ISSUE_EXTERNAL_BLOCKER_KINDS),
+  ref: z.string().trim().min(1).max(200),
+  eventAt: z.string().datetime().nullable().optional().default(null),
+}).strict();
+
+export type IssueExternalBlockerInput = z.infer<typeof issueExternalBlockerSchema>;
+
 const createIssueBaseSchema = z.object({
   projectId: z.string().uuid().optional().nullable(),
   projectWorkspaceId: z.string().uuid().optional().nullable(),
@@ -433,6 +446,7 @@ const createIssueBaseSchema = z.object({
     ]),
     action: multilineTextSchema.pipe(z.string().trim().min(1).max(2_000)),
   }).strict().optional().nullable(),
+  externalBlocker: issueExternalBlockerSchema.optional().nullable(),
   inheritExecutionWorkspaceFromIssueId: z.string().uuid().optional().nullable(),
   title: z.string().min(1),
   description: multilineTextSchema.optional().nullable(),

@@ -831,6 +831,8 @@ export type {
   IssueBlockerAttention,
   IssueBlockerAttentionReason,
   IssueBlockerAttentionState,
+  IssueExternalBlocker,
+  IssueExternalBlockerKind,
   IssueInboxAttentionKind,
   IssueBlockedInboxAction,
   IssueBlockedInboxAttention,
@@ -1269,6 +1271,11 @@ export type {
   FieldDef,
   QuotaWindow,
   ProviderQuotaResult,
+} from "./types/index.js";
+export {
+  ISSUE_EXTERNAL_BLOCKER_KINDS,
+  ISSUE_EXTERNAL_BLOCKER_UNDATED_TTL_MS,
+  isIssueExternalBlockerActive,
 } from "./types/index.js";
 export {
   COMPANY_SEARCH_EXTRACT_KINDS,
