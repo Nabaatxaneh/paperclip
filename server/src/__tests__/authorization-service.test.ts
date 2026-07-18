@@ -1267,6 +1267,100 @@ describeEmbeddedPostgres("authorization service", () => {
     });
   });
 
+  it("allows a service identity to comment across owners but never to mutate", async () => {
+    const company = await createCompany(db, "ServiceCommentScope");
+    const ownerAgent = await createAgent(db, company.id, { role: "engineer" });
+    const serviceAgent = await createAgent(db, company.id, {
+      role: "engineer",
+      permissions: { serviceCommentScope: { enabled: true } },
+    });
+    const issue = await createIssue(db, company.id, {
+      title: "Unattended report target owned by another agent",
+      assigneeAgentId: ownerAgent.id,
+    });
+
+    const authorization = authorizationService(db);
+    const actor = { type: "agent", agentId: serviceAgent.id, companyId: company.id, source: "agent_key" } as const;
+    const resource = {
+      type: "issue",
+      companyId: company.id,
+      issueId: issue.id,
+      projectId: issue.projectId,
+      assigneeAgentId: ownerAgent.id,
+      status: issue.status,
+    } as const;
+
+    // No @-mention exists on this issue, so the mention grant cannot be what allows this.
+    await expect(authorization.decide({ actor, action: "issue:comment", resource })).resolves.toMatchObject({
+      allowed: true,
+      reason: "allow_service_comment_scope",
+    });
+    // The whole point of the scope: reporting rights, not steering rights.
+    await expect(authorization.decide({ actor, action: "issue:mutate", resource })).resolves.toMatchObject({
+      allowed: false,
+      reason: "deny_missing_grant",
+    });
+  });
+
+  it("denies cross-owner comments to agents without the service comment scope", async () => {
+    const company = await createCompany(db, "ServiceCommentScopeControl");
+    const ownerAgent = await createAgent(db, company.id, { role: "engineer" });
+    const plainAgent = await createAgent(db, company.id, { role: "engineer" });
+    const issue = await createIssue(db, company.id, {
+      title: "Control: no service scope",
+      assigneeAgentId: ownerAgent.id,
+    });
+
+    await expect(authorizationService(db).decide({
+      actor: { type: "agent", agentId: plainAgent.id, companyId: company.id, source: "agent_key" },
+      action: "issue:comment",
+      resource: {
+        type: "issue",
+        companyId: company.id,
+        issueId: issue.id,
+        projectId: issue.projectId,
+        assigneeAgentId: ownerAgent.id,
+        status: issue.status,
+      },
+    })).resolves.toMatchObject({ allowed: false, reason: "deny_missing_grant" });
+  });
+
+  it("fails closed on malformed or misplaced service comment scope values", async () => {
+    const company = await createCompany(db, "ServiceCommentScopeMalformed");
+    const ownerAgent = await createAgent(db, company.id, { role: "engineer" });
+    const issue = await createIssue(db, company.id, {
+      title: "Malformed scope target",
+      assigneeAgentId: ownerAgent.id,
+    });
+    const authorization = authorizationService(db);
+
+    const malformedPermissions = [
+      { serviceCommentScope: { enabled: "true" } },          // string, not boolean
+      { serviceCommentScope: { enabled: 1 } },               // truthy non-boolean
+      { serviceCommentScope: {} },                           // present but not enabled
+      { serviceCommentScope: true },                         // not an object
+      // Nested under authorizationPolicy instead of top level: must not grant.
+      { authorizationPolicy: { serviceCommentScope: { enabled: true } } },
+    ];
+
+    for (const permissions of malformedPermissions) {
+      const agent = await createAgent(db, company.id, { role: "engineer", permissions });
+      await expect(authorizationService(db).decide({
+        actor: { type: "agent", agentId: agent.id, companyId: company.id, source: "agent_key" },
+        action: "issue:comment",
+        resource: {
+          type: "issue",
+          companyId: company.id,
+          issueId: issue.id,
+          projectId: issue.projectId,
+          assigneeAgentId: ownerAgent.id,
+          status: issue.status,
+        },
+      })).resolves.toMatchObject({ allowed: false });
+    }
+    expect(authorization).toBeTruthy();
+  });
+
   it("does not grant mention-scoped issue access from self-authored or unauthorized-author comments", async () => {
     const company = await createCompany(db, "MentionCommentDenied");
     const allowedProject = await createProject(db, company.id, "MentionDeniedAllowed");

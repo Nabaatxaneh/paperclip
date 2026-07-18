@@ -3463,8 +3463,42 @@ export function issueRoutes(
     return boundaryDecision;
   }
 
-  function isIssueMentionGrantDecision(decision: true | Awaited<ReturnType<typeof decideIssueAccess>>) {
-    return decision !== true && decision.reason === "allow_issue_mention_grant";
+  // Grants that let an agent comment on an issue it does not own, but must not
+  // let it steer that issue. Both are comment-only by construction in the
+  // authorization service (never returned for issue:mutate); this predicate is
+  // what additionally strips the reopen/resume side effects at the route.
+  function isCommentOnlyGrantDecision(decision: true | Awaited<ReturnType<typeof decideIssueAccess>>) {
+    return decision !== true && (
+      decision.reason === "allow_issue_mention_grant" ||
+      decision.reason === "allow_service_comment_scope"
+    );
+  }
+
+  // ALAA-2079 AC4: machine-authored comments must be distinguishable on the
+  // board by construction rather than by the poster's honesty. Every comment
+  // written by a service identity is stamped authorType "system", which the
+  // board renders as a distinct system-notice card instead of an agent message.
+  // Deliberately not cached: revoking the flag must take effect immediately, and
+  // this is one primary-key lookup on a path that already runs a transaction.
+  async function actorIsServiceIdentity(actor: { actorType: string; agentId?: string | null }) {
+    if (actor.actorType !== "agent" || !actor.agentId) return false;
+    const [row] = await db
+      .select({ permissions: agents.permissions })
+      .from(agents)
+      .where(eq(agents.id, actor.agentId))
+      .limit(1);
+    const scope = row?.permissions?.serviceCommentScope;
+    return Boolean(scope && typeof scope === "object" && (scope as Record<string, unknown>).enabled === true);
+  }
+
+  async function resolveCommentAuthorType(
+    actor: { actorType: string; agentId?: string | null },
+    requested: unknown,
+  ): Promise<"user" | "agent" | "system"> {
+    // A service identity's stamp wins over anything the caller asked for.
+    if (await actorIsServiceIdentity(actor)) return "system";
+    if (requested === "user" || requested === "agent" || requested === "system") return requested;
+    return actor.actorType === "agent" ? "agent" : "user";
   }
 
   async function filterIssuesForActor<T extends Parameters<typeof decideIssueAccess>[1]>(req: Request, rows: T[]) {
@@ -9690,22 +9724,22 @@ export function issueRoutes(
     const interruptRequested = req.body.interrupt === true;
     const isClosed = isClosedIssueStatus(issue.status);
     const isBlocked = issue.status === "blocked";
-    const mentionGrantedPeerAgentCommentOnly =
+    const commentOnlyGrantedPeerAgent =
       isClosed &&
       req.actor.type === "agent" &&
       issue.assigneeAgentId !== null &&
       issue.assigneeAgentId !== req.actor.agentId &&
       !reopenRequested &&
       !resumeRequested &&
-      isIssueMentionGrantDecision(commentAccessDecision);
-    const effectiveReopenRequested = mentionGrantedPeerAgentCommentOnly ? false : reopenRequested;
-    const effectiveResumeRequested = mentionGrantedPeerAgentCommentOnly ? false : resumeRequested;
+      isCommentOnlyGrantDecision(commentAccessDecision);
+    const effectiveReopenRequested = commentOnlyGrantedPeerAgent ? false : reopenRequested;
+    const effectiveResumeRequested = commentOnlyGrantedPeerAgent ? false : resumeRequested;
     if (
       isClosed &&
       req.actor.type === "agent" &&
       issue.assigneeAgentId !== null &&
       issue.assigneeAgentId !== req.actor.agentId &&
-      !mentionGrantedPeerAgentCommentOnly
+      !commentOnlyGrantedPeerAgent
     ) {
       if (!(await assertAgentIssueMutationAllowed(req, res, issue))) return;
     }
@@ -9897,7 +9931,7 @@ export function issueRoutes(
 
       const sourceTrust = await sourceTrustForActorWrite(currentIssue, actor);
       const commentOptions = {
-        authorType: req.body.authorType ?? (actor.actorType === "agent" ? "agent" : "user"),
+        authorType: await resolveCommentAuthorType(actor, req.body.authorType),
         presentation: req.body.presentation ?? null,
         metadata: req.body.metadata ?? null,
         sourceTrust,
@@ -9982,7 +10016,7 @@ export function issueRoutes(
         userId: actor.actorType === "user" ? actor.actorId : undefined,
         runId: actor.runId,
       }, {
-        authorType: req.body.authorType ?? (actor.actorType === "agent" ? "agent" : "user"),
+        authorType: await resolveCommentAuthorType(actor, req.body.authorType),
         presentation: req.body.presentation ?? null,
         metadata: req.body.metadata ?? null,
         sourceTrust: await sourceTrustForActorWrite(currentIssue, actor),

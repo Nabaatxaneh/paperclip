@@ -102,6 +102,7 @@ export type AuthorizationDecision = {
     | "allow_consented_change"
     | "allow_legacy_agent_creator"
     | "allow_issue_mention_grant"
+    | "allow_service_comment_scope"
     | "allow_self"
     | "allow_company_agent"
     | "allow_company_member"
@@ -1322,6 +1323,42 @@ export function authorizationService(db: Db) {
     });
   }
 
+  // Service identities (unattended reporters: EOD recon, daily-brief posters,
+  // scheduled evidence capture) must be able to post their output onto whatever
+  // issue the work belongs to, which is routinely owned by another agent or a
+  // human. The mention grant above cannot express that: it is pull-based and
+  // needs a pre-existing @-mention on each specific issue.
+  //
+  // This grant is deliberately the narrowest thing that solves it:
+  //   - comment-only. It is never consulted for issue:mutate, so a service token
+  //     cannot change status, reassign, or otherwise steer work. The caller-side
+  //     comment-only enforcement (routes/issues.ts) additionally strips the
+  //     reopen/resume side effects, exactly as it does for mention grants.
+  //   - company-scoped. decideBase has already rejected cross-company actors
+  //     before this point.
+  //   - opt-in per agent and fail-closed: only the literal `true` enables it, so
+  //     a malformed or partially-written permissions blob grants nothing.
+  //
+  // It lives at the TOP LEVEL of agents.permissions, NOT under
+  // authorizationPolicy -- evaluateAuthorizationPolicyForAssignment treats keys
+  // it does not recognise as `unknown` and fail-closed denies tasks:assign for
+  // that agent, so nesting it there would break assignment for the holder.
+  function agentHasServiceCommentScope(agent: AgentAuthorizationRow | null | undefined) {
+    const permissions = agent?.permissions;
+    if (!permissions || typeof permissions !== "object") return false;
+    const scope = (permissions as Record<string, unknown>).serviceCommentScope;
+    if (!scope || typeof scope !== "object") return false;
+    return (scope as Record<string, unknown>).enabled === true;
+  }
+
+  function allowServiceCommentScope(action: AuthorizationAction): AuthorizationDecision {
+    return allow({
+      action,
+      reason: "allow_service_comment_scope",
+      explanation: "Allowed by a service identity's cross-owner comment-only scope.",
+    });
+  }
+
   async function decideBase(input: {
     actor: AuthorizationActor;
     action: AuthorizationAction;
@@ -1901,6 +1938,17 @@ export function authorizationService(db: Db) {
         })
       ) {
         return allowIssueMentionGrant(input.action);
+      }
+      if (input.action === "issue:comment" && agentHasServiceCommentScope(actorAgent)) {
+        logger.info({
+          actorAgentId,
+          issueId: resource?.issueId ?? null,
+          companyId,
+          issueAssigneeAgentId: resource?.assigneeAgentId ?? null,
+          grantedAction: input.action,
+          grant: "service_comment_scope",
+        }, "authorized service-identity cross-owner comment grant");
+        return allowServiceCommentScope(input.action);
       }
     }
     if (
