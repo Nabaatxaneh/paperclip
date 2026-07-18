@@ -335,6 +335,19 @@ export type {
   IssueBlockerAttention,
   IssueBlockerAttentionReason,
   IssueBlockerAttentionState,
+  IssueExternalBlocker,
+  IssueExternalBlockerKind,
+  IssueInboxAttentionKind,
+  IssueBlockedInboxAction,
+  IssueBlockedInboxAttention,
+  IssueUnblockDescriptor,
+  IssueUnblockOwner,
+  IssueBlockedInboxIssueRef,
+  IssueBlockedInboxOwner,
+  IssueBlockedInboxOwnerType,
+  IssueBlockedInboxReason,
+  IssueBlockedInboxSeverity,
+  IssueBlockedInboxState,
   IssueProductivityReview,
   IssueProductivityReviewTrigger,
   IssueReferenceSource,
@@ -518,6 +531,18 @@ export type {
   PluginWebhookDeliveryRecord,
   QuotaWindow,
   ProviderQuotaResult,
+} from "./types/index.js";
+export {
+  ISSUE_EXTERNAL_BLOCKER_KINDS,
+  ISSUE_EXTERNAL_BLOCKER_UNDATED_TTL_MS,
+  isIssueExternalBlockerActive,
+} from "./types/index.js";
+export {
+  COMPANY_SEARCH_EXTRACT_KINDS,
+  COMPANY_SEARCH_EXTRACT_SCOPES,
+  COMPANY_SEARCH_SCOPES,
+  COMPANY_SEARCH_SORTS,
+  COMPANY_SEARCH_UPDATED_WITHIN_OPTIONS,
 } from "./types/index.js";
 export {
   ISSUE_REFERENCE_IDENTIFIER_RE,

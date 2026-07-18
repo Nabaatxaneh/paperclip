@@ -17,6 +17,7 @@ import { companies } from "./companies.js";
 import { heartbeatRuns } from "./heartbeat_runs.js";
 import { projectWorkspaces } from "./project_workspaces.js";
 import { executionWorkspaces } from "./execution_workspaces.js";
+import type { IssueExternalBlocker, IssueUnblockDescriptor, SourceTrustMetadata } from "@paperclipai/shared";
 
 export const issues = pgTable(
   "issues",
@@ -50,6 +51,13 @@ export const issues = pgTable(
     assigneeAdapterOverrides: jsonb("assignee_adapter_overrides").$type<Record<string, unknown>>(),
     executionPolicy: jsonb("execution_policy").$type<Record<string, unknown>>(),
     executionState: jsonb("execution_state").$type<Record<string, unknown>>(),
+    monitorNextCheckAt: timestamp("monitor_next_check_at", { withTimezone: true }),
+    monitorWakeRequestedAt: timestamp("monitor_wake_requested_at", { withTimezone: true }),
+    monitorLastTriggeredAt: timestamp("monitor_last_triggered_at", { withTimezone: true }),
+    monitorAttemptCount: integer("monitor_attempt_count").notNull().default(0),
+    monitorNotes: text("monitor_notes"),
+    externalBlocker: jsonb("external_blocker").$type<IssueExternalBlocker>(),
+    monitorScheduledBy: text("monitor_scheduled_by"),
     executionWorkspaceId: uuid("execution_workspace_id")
       .references((): AnyPgColumn => executionWorkspaces.id, { onDelete: "set null" }),
     executionWorkspacePreference: text("execution_workspace_preference"),

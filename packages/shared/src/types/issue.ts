@@ -123,14 +123,75 @@ export interface IssueRelationIssueSummary {
   isSystemSpawned?: boolean;
 }
 
-export type IssueBlockerAttentionState = "none" | "covered" | "stalled" | "needs_attention";
+export type IssueBlockerAttentionState =
+  | "none"
+  | "covered"
+  | "stalled"
+  | "parked_external"
+  | "needs_attention";
 
 export type IssueBlockerAttentionReason =
   | "active_child"
   | "active_dependency"
   | "stalled_review"
+  | "external_actor"
   | "attention_required"
   | null;
+
+/**
+ * ALAA-1681 A1 requires a blocked issue to name a concrete external continuation
+ * (an armed scheduled task, a clock gate, a human, a vendor). Blocker edges are
+ * issue->issue only, so without this the policy-compliant park and the genuinely
+ * abandoned issue are byte-identical to triage. See ALAA-2078.
+ */
+export const ISSUE_EXTERNAL_BLOCKER_KINDS = [
+  "scheduled_task",
+  "clock",
+  "human",
+  "vendor",
+] as const;
+
+export type IssueExternalBlockerKind = (typeof ISSUE_EXTERNAL_BLOCKER_KINDS)[number];
+
+export interface IssueExternalBlocker {
+  kind: IssueExternalBlockerKind;
+  /** Identifier of the actor that owns the next action, e.g. a task name. */
+  ref: string;
+  /** When the external actor is expected to act. Null means "no known date". */
+  eventAt: string | null;
+  /** Server-stamped on write; anchors the TTL for a null-eventAt park. */
+  setAt: string;
+}
+
+/**
+ * A park with no known event date cannot be staleness-checked against `eventAt`,
+ * so it escalates on a TTL measured from `setAt`. Without this, a null `eventAt`
+ * would be a way to hide dead work forever — strictly worse than the mis-flag
+ * this feature removes (ALAA-2078 AC3).
+ */
+export const ISSUE_EXTERNAL_BLOCKER_UNDATED_TTL_MS = 7 * 24 * 60 * 60 * 1000;
+
+/**
+ * Pure decision for AC1/AC3: is a zero-edge blocked issue legitimately parked on
+ * an external actor, or does it need attention? Kept free of DB and clock access
+ * so it is directly unit-testable.
+ */
+export function isIssueExternalBlockerActive(
+  blocker: IssueExternalBlocker | null | undefined,
+  now: Date,
+): boolean {
+  if (!blocker) return false;
+  const nowMs = now.getTime();
+  if (blocker.eventAt) {
+    const eventMs = Date.parse(blocker.eventAt);
+    // An unparseable date must not be treated as an indefinite park.
+    if (Number.isNaN(eventMs)) return false;
+    return eventMs > nowMs;
+  }
+  const setMs = Date.parse(blocker.setAt);
+  if (Number.isNaN(setMs)) return false;
+  return nowMs - setMs < ISSUE_EXTERNAL_BLOCKER_UNDATED_TTL_MS;
+}
 
 export interface IssueBlockerAttention {
   state: IssueBlockerAttentionState;

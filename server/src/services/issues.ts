@@ -29,12 +29,31 @@ import {
 } from "@paperclipai/db";
 import type {
   IssueBlockerAttention,
+  IssueExternalBlocker,
+  IssueBlockedInboxAttention,
+  IssueBlockedInboxIssueRef,
   IssueProductivityReview,
   IssueProductivityReviewTrigger,
   IssueRelationIssueSummary,
 } from "@paperclipai/shared";
-import { clampIssueRequestDepth, extractAgentMentionIds, extractProjectMentionIds, isUuidLike } from "@paperclipai/shared";
-import { conflict, notFound, unprocessable } from "../errors.js";
+import {
+  clampIssueRequestDepth,
+  extractAgentMentionIds,
+  extractProjectMentionIds,
+  issueCommentAuthorTypeSchema,
+  issueCommentMetadataSchema,
+  issueCommentPresentationSchema,
+  isUuidLike,
+  isIssueExternalBlockerActive,
+  normalizeIssueIdentifier as normalizeIssueReferenceIdentifier,
+} from "@paperclipai/shared";
+import { conflict, HttpError, notFound, unprocessable } from "../errors.js";
+import { logger } from "../middleware/logger.js";
+import { parseObject } from "../adapters/utils.js";
+import {
+  hydrateSuccessfulRunHandoffLiveness,
+  SUCCESSFUL_RUN_HANDOFF_LIVE_WAKE_STATUSES,
+} from "./successful-run-handoff-state.js";
 import {
   defaultIssueExecutionWorkspaceSettingsForProject,
   gateProjectExecutionWorkspacePolicy,
@@ -711,13 +730,14 @@ type IssueBlockerAttentionNode = {
   executionRunId?: string | null;
   assigneeAgentId: string | null;
   assigneeUserId: string | null;
+  externalBlocker?: IssueExternalBlocker | null;
 };
 type IssueBlockerAttentionInputNode =
   Pick<
     IssueBlockerAttentionNode,
     "id" | "companyId" | "parentId" | "identifier" | "title" | "status" | "assigneeAgentId" | "assigneeUserId"
   >
-  & { executionRunId?: string | null };
+  & { executionRunId?: string | null; externalBlocker?: IssueExternalBlocker | null };
 
 type IssueBlockerAttentionEdge = {
   issueId: string;
@@ -788,6 +808,33 @@ function createIssueBlockerAttention(input: Partial<IssueBlockerAttention> = {})
 
 function blockerSampleIdentifier(node: IssueBlockerAttentionNode | null | undefined) {
   return node?.identifier ?? node?.id ?? null;
+}
+
+/**
+ * ALAA-2078: `setAt` anchors the AC3 staleness escalation for an undated park, so
+ * it is stamped here rather than accepted from the caller. It is carried over when
+ * the blocker is materially unchanged, so re-asserting the same blocker on a later
+ * heartbeat cannot silently renew the TTL.
+ */
+function normalizeExternalBlockerForWrite(
+  next: unknown,
+  existing: IssueExternalBlocker | null | undefined,
+): IssueExternalBlocker | null {
+  if (!next || typeof next !== "object") return null;
+  const candidate = next as Partial<IssueExternalBlocker>;
+  if (!candidate.kind || !candidate.ref) return null;
+  const eventAt = candidate.eventAt ?? null;
+  const unchanged =
+    existing
+    && existing.kind === candidate.kind
+    && existing.ref === candidate.ref
+    && (existing.eventAt ?? null) === eventAt;
+  return {
+    kind: candidate.kind,
+    ref: candidate.ref,
+    eventAt,
+    setAt: unchanged && existing?.setAt ? existing.setAt : new Date().toISOString(),
+  };
 }
 
 function appendBlockerAttentionEdges(
@@ -1332,9 +1379,24 @@ async function listIssueBlockerAttentionMap(
     return { covered: false, stalled: false, sampleBlockerIdentifier: nodeSample, sampleStalledBlockerIdentifier: null };
   };
 
+  const attentionNow = new Date();
+
   for (const root of roots) {
     const topLevelEdges = (edgesByIssueId.get(root.id) ?? []).filter((edge) => nodesById.get(edge.blockerIssueId)?.status !== "done");
     if (topLevelEdges.length === 0) {
+      // ALAA-2078 AC1/AC3: a blocked issue with no issue-to-issue edges is only
+      // legitimately parked if it names a live external actor. A blocker whose
+      // eventAt has passed (or whose undated TTL has expired) falls back to
+      // needs_attention, so this cannot become a way to hide dead work.
+      const externalBlocker = root.externalBlocker ?? null;
+      if (isIssueExternalBlockerActive(externalBlocker, attentionNow)) {
+        attentionMap.set(root.id, createIssueBlockerAttention({
+          state: "parked_external",
+          reason: "external_actor",
+          sampleBlockerIdentifier: externalBlocker?.ref ?? null,
+        }));
+        continue;
+      }
       attentionMap.set(root.id, createIssueBlockerAttention({
         state: "needs_attention",
         reason: "attention_required",
@@ -1412,6 +1474,7 @@ const issueListSelect = {
   priority: issues.priority,
   assigneeAgentId: issues.assigneeAgentId,
   assigneeUserId: issues.assigneeUserId,
+  externalBlocker: issues.externalBlocker,
   checkoutRunId: issues.checkoutRunId,
   executionRunId: issues.executionRunId,
   executionAgentNameKey: issues.executionAgentNameKey,
@@ -2710,6 +2773,9 @@ export function issueService(db: Db) {
         delete issueData.executionWorkspacePreference;
         delete issueData.executionWorkspaceSettings;
       }
+      if (issueData.externalBlocker !== undefined) {
+        issueData.externalBlocker = normalizeExternalBlockerForWrite(issueData.externalBlocker, null);
+      }
       if (data.assigneeAgentId && data.assigneeUserId) {
         throw unprocessable("Issue can only have one assignee");
       }
@@ -2907,6 +2973,16 @@ export function issueService(db: Db) {
 
       if (issueData.status) {
         assertTransition(existing.status, issueData.status);
+      }
+
+      // ALAA-2078: stamp setAt server-side. A caller must not be able to supply
+      // (or refresh) it, or an undated park could be renewed forever and the AC3
+      // staleness escalation would never fire.
+      if (issueData.externalBlocker !== undefined) {
+        issueData.externalBlocker = normalizeExternalBlockerForWrite(
+          issueData.externalBlocker,
+          existing.externalBlocker,
+        );
       }
 
       const patch: Partial<typeof issues.$inferInsert> = {
