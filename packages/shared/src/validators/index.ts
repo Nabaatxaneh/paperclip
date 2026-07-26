@@ -148,6 +148,7 @@ export {
 } from "./project.js";
 
 export {
+  createIssueBaseSchema,
   createIssueSchema,
   createChildIssueSchema,
   createIssueLabelSchema,

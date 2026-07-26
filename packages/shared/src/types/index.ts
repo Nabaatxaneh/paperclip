@@ -31,26 +31,11 @@ export type {
   IssueGraphLivenessAutoRecoveryPreview,
   IssueGraphLivenessAutoRecoveryPreviewItem,
 } from "./instance.js";
-export type {
-  SmokeLabServiceStatus,
-  SmokeRun,
-  SmokeRunStatus,
-  SmokeRunStep,
-  SmokeRunStepPath,
-  SmokeRunStepStatus,
-  SmokeRunTrigger,
-} from "./smoke-lab.js";
 export {
   ISSUE_EXTERNAL_BLOCKER_KINDS,
   ISSUE_EXTERNAL_BLOCKER_UNDATED_TTL_MS,
   isIssueExternalBlockerActive,
 } from "./issue.js";
-export {
-  SMOKE_RUN_STATUSES,
-  SMOKE_RUN_STEP_PATHS,
-  SMOKE_RUN_STEP_STATUSES,
-  SMOKE_RUN_TRIGGERS,
-} from "./smoke-lab.js";
 export {
   DAILY_RETENTION_PRESETS,
   WEEKLY_RETENTION_PRESETS,
@@ -160,17 +145,6 @@ export type {
   IssueBlockerAttentionState,
   IssueExternalBlocker,
   IssueExternalBlockerKind,
-  IssueInboxAttentionKind,
-  IssueBlockedInboxAction,
-  IssueBlockedInboxAttention,
-  IssueUnblockDescriptor,
-  IssueUnblockOwner,
-  IssueBlockedInboxIssueRef,
-  IssueBlockedInboxOwner,
-  IssueBlockedInboxOwnerType,
-  IssueBlockedInboxReason,
-  IssueBlockedInboxSeverity,
-  IssueBlockedInboxState,
   IssueProductivityReview,
   IssueProductivityReviewTrigger,
   IssueReferenceSource,

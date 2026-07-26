@@ -30,8 +30,6 @@ import {
 import type {
   IssueBlockerAttention,
   IssueExternalBlocker,
-  IssueBlockedInboxAttention,
-  IssueBlockedInboxIssueRef,
   IssueProductivityReview,
   IssueProductivityReviewTrigger,
   IssueRelationIssueSummary,
@@ -40,20 +38,10 @@ import {
   clampIssueRequestDepth,
   extractAgentMentionIds,
   extractProjectMentionIds,
-  issueCommentAuthorTypeSchema,
-  issueCommentMetadataSchema,
-  issueCommentPresentationSchema,
   isUuidLike,
   isIssueExternalBlockerActive,
-  normalizeIssueIdentifier as normalizeIssueReferenceIdentifier,
 } from "@paperclipai/shared";
-import { conflict, HttpError, notFound, unprocessable } from "../errors.js";
-import { logger } from "../middleware/logger.js";
-import { parseObject } from "../adapters/utils.js";
-import {
-  hydrateSuccessfulRunHandoffLiveness,
-  SUCCESSFUL_RUN_HANDOFF_LIVE_WAKE_STATUSES,
-} from "./successful-run-handoff-state.js";
+import { conflict, notFound, unprocessable } from "../errors.js";
 import {
   defaultIssueExecutionWorkspaceSettingsForProject,
   gateProjectExecutionWorkspacePolicy,

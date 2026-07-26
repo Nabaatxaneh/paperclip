@@ -186,7 +186,7 @@ export const issueExternalBlockerSchema = z.object({
 
 export type IssueExternalBlockerInput = z.infer<typeof issueExternalBlockerSchema>;
 
-const createIssueBaseSchema = z.object({
+export const createIssueBaseSchema = z.object({
   projectId: z.string().uuid().optional().nullable(),
   projectWorkspaceId: z.string().uuid().optional().nullable(),
   goalId: z.string().uuid().optional().nullable(),
@@ -222,7 +222,7 @@ export const createIssueSchema = withCreateIssueStatusDefault(createIssueBaseSch
 
 export type CreateIssue = z.infer<typeof createIssueSchema>;
 
-export const createChildIssueSchema = createIssueSchema
+export const createChildIssueSchema = createIssueBaseSchema
   .omit({
     parentId: true,
     inheritExecutionWorkspaceFromIssueId: true,
@@ -241,7 +241,7 @@ export const createIssueLabelSchema = z.object({
 
 export type CreateIssueLabel = z.infer<typeof createIssueLabelSchema>;
 
-export const updateIssueSchema = createIssueSchema.partial().extend({
+export const updateIssueSchema = createIssueBaseSchema.partial().extend({
   requestDepth: issueRequestDepthInputSchema.optional(),
   assigneeAgentId: z.string().trim().min(1).optional().nullable(),
   comment: multilineTextSchema.pipe(z.string().trim().min(1)).optional(),
