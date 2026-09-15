@@ -2,6 +2,7 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { asBoolean } from "@paperclipai/adapter-utils/server-utils";
+import { adaptiveThinkingVariantDefinitions } from "./run-args.js";
 
 type PreparedOpenCodeRuntimeConfig = {
   env: Record<string, string>;
@@ -67,11 +68,44 @@ export async function prepareOpenCodeRuntimeConfig(input: {
   const existingPermission = isPlainObject(existingConfig.permission)
     ? existingConfig.permission
     : {};
+  const existingProvider = isPlainObject(existingConfig.provider)
+    ? (existingConfig.provider as Record<string, unknown>)
+    : {};
+  const existingOpenCodeProvider = isPlainObject(existingProvider.opencode)
+    ? (existingProvider.opencode as Record<string, unknown>)
+    : {};
+  const existingOpenCodeModels = isPlainObject(existingOpenCodeProvider.models)
+    ? (existingOpenCodeProvider.models as Record<string, unknown>)
+    : {};
+  const adaptiveModels = adaptiveThinkingVariantDefinitions();
+  const nextOpenCodeModels: Record<string, unknown> = { ...existingOpenCodeModels };
+  for (const [modelId, definition] of Object.entries(adaptiveModels)) {
+    const existingModel = isPlainObject(nextOpenCodeModels[modelId])
+      ? (nextOpenCodeModels[modelId] as Record<string, unknown>)
+      : {};
+    const existingVariants = isPlainObject(existingModel.variants)
+      ? (existingModel.variants as Record<string, unknown>)
+      : {};
+    nextOpenCodeModels[modelId] = {
+      ...existingModel,
+      variants: {
+        ...existingVariants,
+        ...definition,
+      },
+    };
+  }
   const nextConfig = {
     ...existingConfig,
     permission: {
       ...existingPermission,
       external_directory: "allow",
+    },
+    provider: {
+      ...existingProvider,
+      opencode: {
+        ...existingOpenCodeProvider,
+        models: nextOpenCodeModels,
+      },
     },
   };
   await fs.writeFile(runtimeConfigPath, `${JSON.stringify(nextConfig, null, 2)}\n`, "utf8");
@@ -83,6 +117,7 @@ export async function prepareOpenCodeRuntimeConfig(input: {
     },
     notes: [
       "Injected runtime OpenCode config with permission.external_directory=allow to avoid headless approval prompts.",
+      "Defined the paperclip_adaptive thinking variant (thinking.type.adaptive) for models whose upstream requires it (ALAA-3794).",
     ],
     cleanup: async () => {
       await fs.rm(runtimeConfigHome, { recursive: true, force: true });
