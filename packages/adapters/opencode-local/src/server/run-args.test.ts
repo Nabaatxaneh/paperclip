@@ -23,6 +23,40 @@ describe("buildOpenCodeRunArgs", () => {
     ).toEqual(["run", "--format", "json", "--model", "opencode/glm-5.2", "--variant", "low", "--foo"]);
   });
 
+  it("overrides a built-in thinking variant with adaptive on a gated model (ALAA-3794 fleet case)", () => {
+    expect(
+      buildOpenCodeRunArgs({ model: "opencode/claude-opus-5", variant: "max" }),
+    ).toEqual([
+      "run",
+      "--format",
+      "json",
+      "--model",
+      "opencode/claude-opus-5",
+      "--variant",
+      PAPERCLIP_ADAPTIVE_VARIANT,
+    ]);
+  });
+
+  it("keeps a built-in thinking variant on models outside the capability gate", () => {
+    expect(
+      buildOpenCodeRunArgs({ model: "opencode/glm-5.2", variant: "max" }),
+    ).toEqual(["run", "--format", "json", "--model", "opencode/glm-5.2", "--variant", "max"]);
+  });
+
+  it("passes through a custom variant on a gated model", () => {
+    expect(
+      buildOpenCodeRunArgs({ model: "opencode/claude-opus-5", variant: "my_custom" }),
+    ).toEqual([
+      "run",
+      "--format",
+      "json",
+      "--model",
+      "opencode/claude-opus-5",
+      "--variant",
+      "my_custom",
+    ]);
+  });
+
   it("passes --session before --model/--variant on resume", () => {
     expect(
       buildOpenCodeRunArgs({ model: "opencode/claude-opus-5", resumeSessionId: "ses_123" }),

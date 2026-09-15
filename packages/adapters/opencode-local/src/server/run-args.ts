@@ -1,6 +1,8 @@
 import { asString, asStringArray } from "@paperclipai/adapter-utils/server-utils";
 
-// Fallback variant Paperclip passes when the agent config does not set one.
+// Adaptive variant Paperclip passes for capability-gated models: as the
+// fallback when no variant is configured, and as an override over a
+// configured built-in thinking variant.
 //
 // Background (ALAA-3794): opencode 1.17.x sends `thinking.type.enabled` for
 // its built-in thinking variants (low/high/max/...) even on models whose
@@ -12,6 +14,13 @@ import { asString, asStringArray } from "@paperclipai/adapter-utils/server-utils
 // custom variant definition (see runtime-config.ts, which defines it only
 // for the verified models below).
 export const PAPERCLIP_ADAPTIVE_VARIANT = "paperclip_adaptive";
+
+// Built-in opencode thinking variants that resolve to the legacy
+// `thinking.type.enabled` request shape (ALAA-3794 Error A). When one of
+// these is configured on a capability-gated model, the gate overrides it
+// with PAPERCLIP_ADAPTIVE_VARIANT. Unknown/custom variant names pass
+// through untouched.
+export const BUILTIN_THINKING_VARIANTS = new Set(["low", "medium", "high", "max"]);
 
 // Model IDs (without provider prefix) verified to accept
 // `thinking: { type: "adaptive" }` on the opencode provider path. Extend only
@@ -58,7 +67,13 @@ export function buildOpenCodeRunArgs(input: {
   const args = ["run", "--format", "json"];
   if (input.resumeSessionId) args.push("--session", input.resumeSessionId);
   if (model) args.push("--model", model);
-  args.push("--variant", variant || PAPERCLIP_ADAPTIVE_VARIANT);
+  // ALAA-3794: on capability-gated models the adaptive variant takes
+  // precedence over a configured built-in thinking variant (every live seat
+  // pins `variant: "max"`, so a fallback-only branch is a no-op fleet-wide).
+  const useAdaptive =
+    isAdaptiveThinkingModel(model) &&
+    (!variant || variant === PAPERCLIP_ADAPTIVE_VARIANT || BUILTIN_THINKING_VARIANTS.has(variant.toLowerCase()));
+  args.push("--variant", useAdaptive ? PAPERCLIP_ADAPTIVE_VARIANT : variant || PAPERCLIP_ADAPTIVE_VARIANT);
   if (extraArgs.length > 0) args.push(...extraArgs);
   return args;
 }
